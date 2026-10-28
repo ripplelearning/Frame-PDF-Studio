@@ -212,7 +212,8 @@ kbd{background:var(--panel);border:1px solid var(--line);border-radius:4px;paddi
 <div id="menu-root"></div>
 <div id="dialog-root"></div>
 <footer class="site">
-  FRAME PDF Studio (Free Remediation And Manual Editing) — built so blind screen reader users can do document remediation work. All processing is local; no data is uploaded anywhere.
+  FRAME PDF Studio (Free Remediation And Manual Editing) — built so blind screen reader users can do document remediation work. All document processing is local; no document data is uploaded anywhere. Feedback you choose to send is the only exception.
+  <button type="button" id="feedback-btn" hidden>Provide Feedback</button>
 </footer>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js" integrity="sha384-/1qUCSGwTur9vjf/z9lmu/eCUYbpOTgSjmpbMQZ1/CtX2v/WcAIKqRv+U1DUCG6e" crossorigin="anonymous"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js" integrity="sha384-rNlaE5fs9dGIjmxWDALQh/RBAaGRYT5ChrzHo6tRfgrZ36iRFAiquP5g41Jsv+0j" crossorigin="anonymous"></script>
@@ -325,6 +326,90 @@ function fieldRow(name, label, type="text", value="", required=false, hint=""){
 function selectRow(name, label, options, value=""){
   const opts = options.map(o=>`<option value="${o[0]}"${o[0]===value?" selected":""}>${o[1]}</option>`).join("");
   return `<label class="field" for="df-${name}"><span>${label}</span><select id="df-${name}" data-f="${name}">${opts}</select></label>`;
+}
+
+/* ---------- feedback: an optional message to the developer ----------
+   HOW THIS KEEPS THE DEVELOPER'S ADDRESS PRIVATE: this page never
+   contains an email address. Feedback goes to FEEDBACK_ENDPOINT, a
+   form-relay URL (a Formspree or Web3Forms free endpoint). The relay
+   service maps that endpoint to the developer's inbox on its own side,
+   so anyone reading this page sees only the endpoint ID, never the
+   address. A static page alone cannot send mail, so a relay like this
+   is required; the tradeoff is that anyone who reads the endpoint ID
+   can submit to it, which is why the form has a honeypot field below
+   and the relay's own spam filtering applies.
+   SETUP (completely free, no card, no paid tier): use either a
+   Formspree free form (50 submissions a month) or a Web3Forms free
+   form (250 submissions a month). For Formspree, paste the form
+   endpoint URL below. For Web3Forms, paste
+   https://api.web3forms.com/submit below and the access key in
+   FEEDBACK_ACCESS_KEY. While the endpoint is empty, the footer button
+   stays hidden, so users never see a form that cannot send. An email
+   address must NEVER be typed into this file. */
+const FEEDBACK_ENDPOINT = "https://api.web3forms.com/submit";
+// Optional public access key for relays that use one (Web3Forms). It is
+// public by design, not an email address, and is only sent to the relay.
+const FEEDBACK_ACCESS_KEY = "bbf5c237-6b84-4489-ac9d-7e7caf3037af";
+
+function openFeedbackDialog(vals={}, error=""){
+  const body = `
+    <p>Sending feedback shares only what you type here with the developer. Your name and email are optional, and are used only if a reply is needed. Nothing about your documents is sent.</p>
+    ${error ? `<p role="alert" class="status">${escapeHtml(error)}</p>` : ""}
+    <label class="field" for="df-message"><span>Message (required)</span>
+    <textarea id="df-message" data-f="message" rows="6">${escapeHtml(vals.message || "")}</textarea></label>
+    ${fieldRow("fb_name", "Your name (optional)", "text", vals.fb_name || "")}
+    ${fieldRow("fb_email", "Your email (optional)", "email", vals.fb_email || "")}
+    <div class="sr-only" aria-hidden="true"><label>Website <input type="text" data-f="website" tabindex="-1" autocomplete="off"></label></div>`;
+  openDialog({title: "Provide Feedback", bodyHTML: body, submitLabel: "Send", onSubmit: submitFeedback});
+}
+
+async function submitFeedback(vals){
+  const message = (vals.message || "").trim();
+  if (!message){
+    announce("Please write a message before sending.");
+    openFeedbackDialog(vals, "Please write a message before sending.");
+    return;
+  }
+  const email = (vals.fb_email || "").trim();
+  if (email && !email.includes("@")){
+    announce("Please enter a valid email address, or leave it blank.");
+    openFeedbackDialog(vals, "Please enter a valid email address, or leave it blank.");
+    return;
+  }
+  // Honeypot field: only automated submitters fill it. Treat those as
+  // sent without delivering anything, so the filter is never revealed.
+  if ((vals.website || "").trim()){
+    announce("Thank you. Your feedback was sent.");
+    return;
+  }
+  if (!FEEDBACK_ENDPOINT){
+    openFeedbackDialog(vals, "Feedback is not set up yet. Please try again later.");
+    return;
+  }
+  announce("Sending feedback…");
+  try {
+    const res = await fetch(FEEDBACK_ENDPOINT, {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "Accept": "application/json"},
+      body: JSON.stringify({
+        ...(FEEDBACK_ACCESS_KEY ? {access_key: FEEDBACK_ACCESS_KEY} : {}),
+        message, name: (vals.fb_name || "").trim(), email
+      })
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    announce("Thank you. Your feedback was sent.");
+  } catch (err){
+    announce("Feedback could not be sent. Your message is kept here so you can try again.");
+    openFeedbackDialog(vals, "Feedback could not be sent. Check your connection and try again.");
+  }
+}
+
+if (FEEDBACK_ENDPOINT){
+  const fbBtn = $("feedback-btn");
+  if (fbBtn){
+    fbBtn.hidden = false;
+    fbBtn.addEventListener("click", ()=>openFeedbackDialog());
+  }
 }
 
 /* ---------- undo ---------- */
@@ -2179,12 +2264,12 @@ function userGuideDialog(){
     `<li><strong>pdf-lib 1.17.1</strong> — builds the exported tagged PDF. <em>Limitations:</em> the tag structure comes from FRAME's own document model; always validate important deliverables in a dedicated checker such as PAC or Adobe Acrobat Pro.</li>`+
     `<li><strong>Pako 2.1.0</strong> — compression support for PDF handling. No user-facing limitations.</li>`+
     `<li><strong>Tesseract.js 5.1.0</strong> — optical character recognition for scanned pages. <em>Limitations:</em> accuracy depends on scan quality; it can be slow on long documents; language data is downloaded on first use.</li>`+
-    `<li><strong>Transformers.js 3.7.0 with Florence-2-base (Microsoft Research)</strong> — the on-device AI that drafts image descriptions. <em>Limitations:</em> descriptions are AI guesses and can be wrong — always review them; it is weaker on text inside images and on exact chart values (use Create data table for charts); the model is a one-time download of about 170&nbsp;MB and runs on your CPU, so the first description takes a while.</li>`+
+    `<li><strong>Transformers.js 3.7.0 with Florence-2-base (Microsoft Research)</strong> — the on-device AI that drafts image descriptions. <em>Limitations:</em> descriptions are AI guesses and can be wrong — always review them; it is weaker on text inside images and on exact chart values (use Create data table for charts); the model is a one-time download of about 400&nbsp;MB and runs on your CPU, so the first description takes a while.</li>`+
     `<li><strong>Web Audio API (built into your browser)</strong> — sonifies chart data as pitch. <em>Limitations:</em> pitch gives a sense of trend only, not exact values.</li>`+
     `</ul>`+
     h("ug-privacy","Privacy")+
     `<p><strong>Your documents and your work never leave your device.</strong> There is no account, no analytics, no telemetry, and nothing is uploaded anywhere — ever — without your express action.</p>`+
-    `<p>The only network activity is downloading the tool's own code and resources: the libraries above load from public CDNs when the page opens, and the AI image-description model (about 170&nbsp;MB) downloads from its public host <em>only</em> when you click <strong>Generate draft description (AI, on-device)</strong> — that click is your consent, and the download happens once, then the model is cached. Your PDFs, remediation work, form entries, and session files are never transmitted.</p>`+
+    `<p>The only network activity is downloading the tool's own code and resources: the libraries above load from public CDNs when the page opens, and the AI image-description model (about 400&nbsp;MB) downloads from its public host <em>only</em> when you click <strong>Generate draft description (AI, on-device)</strong> — that click is your consent, and the download happens once, then the model is cached. Your PDFs, remediation work, form entries, and session files are never transmitted.</p>`+
     `<p>Autosave and filled-form data are stored in your browser's local storage on your device. Clearing your browser's site data will remove them — use Save As to keep a session file.</p>`+
     h("ug-risks","Risks and shortcomings")+
     `<ul>`+
@@ -3063,11 +3148,11 @@ async function generateImageDraft(imgItem, onProgress){
     const modelId = "onnx-community/Florence-2-base";
     const cb = (p)=>{
       if (p.status === "downloading" && p.total)
-        prog(`Downloading AI model… ${Math.round(p.loaded/p.total*100)}% (one-time, about 170 MB)`);
+        prog(`Downloading AI model… ${Math.round(p.loaded/p.total*100)}% (one-time, about 400 MB)`);
       else if (p.status === "downloading")
-        prog("Downloading AI model… (one-time, about 170 MB)");
+        prog("Downloading AI model… (one-time, about 400 MB)");
     };
-    prog("Downloading AI model… (one-time, about 170 MB)");
+    prog("Downloading AI model… (one-time, about 400 MB)");
     const [model, processor, tokenizer] = await Promise.all([
       T.Florence2ForConditionalGeneration.from_pretrained(modelId, { dtype: "q4", progress_callback: cb }),
       T.AutoProcessor.from_pretrained(modelId, { progress_callback: cb }),
