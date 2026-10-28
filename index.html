@@ -393,7 +393,14 @@ async function submitFeedback(vals){
       headers: {"Content-Type": "application/json", "Accept": "application/json"},
       body: JSON.stringify({
         ...(FEEDBACK_ACCESS_KEY ? {access_key: FEEDBACK_ACCESS_KEY} : {}),
-        message, name: (vals.fb_name || "").trim(), email
+        // Identify this project in the notification: subject line, sender
+        // name, and a body field, so feedback stays distinguishable if
+        // the same relay serves other projects.
+        subject: "FRAME PDF Studio feedback",
+        from_name: "FRAME PDF Studio",
+        project: "FRAME PDF Studio",
+        message, name: (vals.fb_name || "").trim(), email,
+        ...(email ? {replyto: email} : {})
       })
     });
     if (!res.ok) throw new Error("HTTP " + res.status);
