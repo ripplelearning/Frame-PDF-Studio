@@ -4562,7 +4562,7 @@ function exportLinkHref(it){
 }
 function buildHTMLString(){
   const title = S.docTitle || S.fileName;
-  let h = `<!DOCTYPE html>\n<html lang="en">\n<head><meta charset="utf-8">\n<title>${escapeHtml(title)}</title>\n<style>\n.print-value { display: none; }\n.save-btn { font-size: 1rem; padding: 0.6rem 1.2rem; cursor: pointer; }\n@media print {\n  .instructions, .save-btn { display: none !important; }\n  input, select { display: none !important; }\n  .print-value { display: inline; }\n}\n</style>\n</head>\n<body>\n<h1>${escapeHtml(title)}</h1>\n`;
+  let h = `<!DOCTYPE html>\n<html lang="en">\n<head><meta charset="utf-8">\n<title>${escapeHtml(title)}</title>\n<style>\n.print-value { display: none; }\n.save-btn { font-size: 1rem; padding: 0.6rem 1.2rem; cursor: pointer; }\n@media print {\n  .instructions, .save-btn { display: none !important; }\n  body > h1.doc-title { display: none !important; }\n  .field-label { display: none !important; }\n  input, select { display: none !important; }\n  .print-value { display: inline; }\n}\n</style>\n</head>\n<body>\n<h1 class="doc-title">${escapeHtml(title)}</h1>\n`;
   S.pages.forEach(pg=>{
     h += `<section aria-label="Page ${pg.pageNum}" id="page-${pg.pageNum}">\n`;
     const items = pg.items.filter(i=>!i.hidden && !i.artifact).sort((a,b)=>a.order-b.order);
@@ -4622,9 +4622,9 @@ function tableToHTML(pg, titem){
 function fieldToHTML(it){
   const label = escapeHtml(it.tooltip||it.fieldName);
   const v = S.filled[it.fieldName];
-  if (it.widget==="text") return `<p><label>${label}<br><input type="text" class="fillable-field" value="${escapeHtml(v||"")}"><span class="print-value" aria-hidden="true"></span></label></p>\n`;
+  if (it.widget==="text") return `<p><label><span class="field-label">${label}</span><br><input type="text" class="fillable-field" value="${escapeHtml(v||"")}"><span class="print-value" aria-hidden="true"></span></label></p>\n`;
   if (it.widget==="checkbox") return `<p><label><input type="checkbox" class="fillable-field"${v?" checked":""}> ${label}<span class="print-value" aria-hidden="true"></span></label></p>\n`;
-  if (it.widget==="dropdown") return `<p><label>${label}<br><select class="fillable-field">${it.options.map(o=>`<option${v===o?" selected":""}>${escapeHtml(o)}</option>`).join("")}</select><span class="print-value" aria-hidden="true"></span></label></p>\n`;
+  if (it.widget==="dropdown") return `<p><label><span class="field-label">${label}</span><br><select class="fillable-field">${it.options.map(o=>`<option${v===o?" selected":""}>${escapeHtml(o)}</option>`).join("")}</select><span class="print-value" aria-hidden="true"></span></label></p>\n`;
   return `<p>${label}</p>\n`;
 }
 
