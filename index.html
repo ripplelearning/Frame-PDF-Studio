@@ -677,7 +677,8 @@ async function extractPage(pdfDoc, pageNum){
   items.forEach((it,i)=>it.order=i);
 
   return { pageNum, pdfPage:page, items,
-    widthPt: page.view[2]-page.view[0], heightPt: page.view[3]-page.view[1] };
+    widthPt: page.view[2]-page.view[0], heightPt: page.view[3]-page.view[1],
+    rotation: page.rotate || 0 };
 }
 </script>
 
@@ -3741,6 +3742,32 @@ function tableOperation(pg, t, op, sel){
 }
 
 /* ---------- form field creation ---------- */
+/* ----- rotated pages: rect conversion between PDF user space and display space -----
+   FRAME stores item rects in unrotated PDF user space, but the user places a
+   field relative to what they see (display space, rotation applied). On a
+   rotated page the two differ: an unrotated 300x22 box displays as a thin
+   vertical strip. Convert through display space so a new field lands where it
+   looks like it should. Identity on unrotated pages. */
+function pageRotation(pg){
+  if (pg.rotation!==undefined && pg.rotation!==null) return pg.rotation;
+  if (pg.pdfPage && pg.pdfPage.rotate) return pg.pdfPage.rotate;
+  return 0;
+}
+function itemDisplayRect(it, pg){
+  const W = pg.widthPt, H = pg.heightPt, R = pageRotation(pg);
+  const {x, y, w, h} = it;
+  if (R===90) return {x:y, y:W-x-w, w:h, h:w};
+  if (R===180) return {x:W-x-w, y:H-y-h, w, h};
+  if (R===270) return {x:H-y-h, y:x, w:h, h:w};
+  return {x, y, w, h};
+}
+function displayRectToPdf(r, pg){
+  const W = pg.widthPt, H = pg.heightPt, R = pageRotation(pg);
+  if (R===90) return {x:W-r.y-r.h, y:r.x, w:r.h, h:r.w};
+  if (R===180) return {x:W-r.x-r.w, y:H-r.y-r.h, w:r.w, h:r.h};
+  if (R===270) return {x:r.y, y:H-r.x-r.w, w:r.h, h:r.w};
+  return {x:r.x, y:r.y, w:r.w, h:r.h};
+}
 function createFieldDialog(preset){
   const sel = selectedItems();
   const refItem = activeOrSingle(sel) || (sel.length ? sel[sel.length-1] : null);
@@ -3766,11 +3793,10 @@ function createFieldDialog(preset){
       }
       pushUndo();
       // Replace the selected text object: remove it and reuse its position.
-      let rx = 72, ry = null, replaceIdx = -1;
+      let replaceIdx = -1;
       if (replaceTarget && replaceTarget.page===targetPage){
         replaceIdx = pg.items.indexOf(replaceTarget);
         if (replaceIdx>=0){
-          rx = replaceTarget.x; ry = replaceTarget.y;
           pg.items.splice(replaceIdx,1);
           S.selected.delete(replaceTarget.id);
         }
@@ -3786,8 +3812,19 @@ function createFieldDialog(preset){
         sorted.forEach((it,i)=>it.order=i);
         pg.items = sorted;
       };
-      const y = ry!==null ? ry : (after ? after.y - 30 : 72);
       const dims = {text:[300,22],checkbox:[16,16],radio:[16,16],dropdown:[200,24]}[v.widget];
+      // Place the field in display space (what the user sees), then convert
+      // to PDF user space for storage/export. On unrotated pages this is an
+      // identity transform, so existing behavior is unchanged there.
+      const anchorD = replaceTarget ? itemDisplayRect(replaceTarget, pg)
+        : (after ? itemDisplayRect(after, pg) : null);
+      const placeField = (oi)=>{
+        let d;
+        if (replaceTarget) d = {x:anchorD.x, y:anchorD.y - oi*24, w:dims[0], h:dims[1]};
+        else if (anchorD) d = {x:72, y:anchorD.y - 30 - oi*24, w:dims[0], h:dims[1]};
+        else d = {x:72, y:72, w:dims[0], h:dims[1]};
+        return displayRectToPdf(d, pg);
+      };
       if (v.widget==="radio"){
         // one item per option (shared group name) — renders and exports correctly
         const opts = v.options.split(",").map(s=>s.trim()).filter(Boolean);
@@ -3795,9 +3832,10 @@ function createFieldDialog(preset){
         const made = [];
         let prevId = null;
         names.forEach((op,oi)=>{
+          const r0 = placeField(oi);
           const newItem = {id:uid("p"+targetPage+"-i"), page:targetPage, kind:"field", role:"Form",
             order:0, artifact:false, url:"", alt:"",
-            text:`Field: ${v.fname.trim()}`, x:replacing?rx:72, y:y-oi*24, w:16, h:16,
+            text:`Field: ${v.fname.trim()}`, x:r0.x, y:r0.y, w:r0.w, h:r0.h,
             fieldName:v.fname.trim(), fieldType:"Btn",
             widget:"radio", tooltip:`${v.tooltip.trim()}: ${op}`, value:"",
             options:[], isNew:true, optLabel:op, groupLabel:v.tooltip.trim()};
@@ -3812,9 +3850,10 @@ function createFieldDialog(preset){
         logEvent("Created radio group", `"${v.fname}" with ${names.length} options`);
         announce(`Radio group "${v.fname}" created with ${names.length} options${replacing?", replacing the selected text":""}.`);
       } else {
+        const r0 = placeField(0);
         const it = {id:uid("p"+targetPage+"-i"), page:targetPage, kind:"field", role:"Form",
           order:0, artifact:false, url:"", alt:"",
-          text:`Field: ${v.fname.trim()}`, x:replacing?rx:72, y, w:dims[0], h:dims[1],
+          text:`Field: ${v.fname.trim()}`, x:r0.x, y:r0.y, w:r0.w, h:r0.h,
           fieldName:v.fname.trim(), fieldType: v.widget==="dropdown"?"Ch":(v.widget==="text"?"Tx":"Btn"),
           widget:v.widget, tooltip:v.tooltip.trim(), value:"",
           options:v.options.split(",").map(s=>s.trim()).filter(Boolean), isNew:true};
@@ -4844,10 +4883,11 @@ function ascii85Decode(data){
 }
 function decodeStreamBytes(raw, filterObj){
   // PDF filter arrays list filters in DECODE order (verified against pdf-lib/pypdf).
+  // NOTE: use instanceof, never constructor.name — the minified pdf-lib build
+  // mangles class names, so constructor.name is "e" for every class.
   let names = [];
   if (filterObj){
-    const t = filterObj.constructor.name;
-    if (t==="PDFArray"){ for(let i=0;i<filterObj.size();i++) names.push(filterObj.get(i).toString()); }
+    if (filterObj instanceof PDFLib.PDFArray){ for(let i=0;i<filterObj.size();i++) names.push(filterObj.get(i).toString()); }
     else names.push(filterObj.toString());
   }
   let data = raw;
@@ -4869,13 +4909,18 @@ function pageContentsInfo(ctx, page){
   const cRef = page.node.get(PDFLib.PDFName.of("Contents"));
   if (!cRef) return null;
   const cObj = ctx.lookup(cRef);
-  const streams = cObj.constructor.name==="PDFArray"
+  // NOTE: use instanceof, never constructor.name — the minified pdf-lib build
+  // mangles class names, so constructor.name is "e" for every class. The old
+  // check silently treated a multi-stream Contents array as a single stream,
+  // which threw "s.getContents is not a function" and left the page untagged.
+  const streams = cObj instanceof PDFLib.PDFArray
     ? [...Array(cObj.size()).keys()].map(i=>ctx.lookup(cObj.get(i)))
     : [cObj];
   // decode each stream with its own filters, then merge the decoded bytes.
   // (pdf-lib wraps page content in q...Q streams when form fields are added,
   // so a single filter list no longer describes merged raw bytes.)
   const decodedStreams = streams.map(s=>{
+    if (typeof s.getContents!=="function") return new Uint8Array(0);
     const raw = s.getContents();
     const filterObj = s.dict.get(PDFLib.PDFName.of("Filter"));
     return decodeStreamBytes(raw, filterObj);
