@@ -546,22 +546,38 @@ function setFileStatus(msg, isAlert){
 }
 
 /* Group raw pdf.js text items into reading blocks. */
-function groupTextItems(rawItems){
+function groupTextItems(rawItems, rotation, pageW, pageH){
   const items = rawItems.filter(t=>t.str && t.str.trim().length>0).map(t=>({
     str:t.str, x:t.transform[4], y:t.transform[5],
     w:t.width, h:t.height || Math.abs(t.transform[3]) || 10,
     size: Math.abs(t.transform[0]) || Math.abs(t.transform[3]) || 10,
   }));
   if (!items.length) return [];
+  // On rotated pages, text that is far apart visually can share a stored
+  // baseline, so a line must agree in BOTH stored space and display space,
+  // or a fragment from another visual line gets merged into it (e.g. the
+  // "th" of "25th" joining the line above it, or the title swallowing "25").
+  // Unrotated pages keep exactly the original behaviour.
+  const R = rotation || 0;
+  if (R!==0){
+    const dispY = (it)=>{
+      if (R===90) return pageW - it.x + it.h/2;
+      if (R===180) return pageH - it.y + it.h/2;
+      if (R===270) return it.x + it.h/2;
+      return it.y - it.h/2;
+    };
+    items.forEach(it=>{ it.dy = dispY(it); });
+  }
   items.sort((a,b)=> b.y - a.y || a.x - b.x);
   // cluster into lines by baseline
   const lines = [];
   for (const it of items){
     const tol = Math.max(2, it.h*0.4);
-    let line = lines.find(l=>Math.abs(l.y - it.y) <= tol);
-    if (!line){ line = {y:it.y, h:it.h, size:it.size, parts:[]}; lines.push(line); }
+    let line = lines.find(l=>Math.abs(l.y - it.y) <= tol && (R===0 || Math.abs(l.dy - it.dy) <= tol));
+    if (!line){ line = {y:it.y, dy:it.dy, h:it.h, size:it.size, parts:[]}; lines.push(line); }
     line.parts.push(it);
     line.y = line.parts.reduce((s,p)=>s+p.y,0)/line.parts.length;
+    if (R!==0) line.dy = line.parts.reduce((s,p)=>s+p.dy,0)/line.parts.length;
   }
   lines.forEach(l=>l.parts.sort((a,b)=>a.x-b.x));
   lines.sort((a,b)=> b.y - a.y);
@@ -597,7 +613,8 @@ function median(a){ const s=[...a].sort((x,y)=>x-y); return s[Math.floor(s.lengt
 async function extractPage(pdfDoc, pageNum){
   const page = await pdfDoc.getPage(pageNum);
   const tc = await page.getTextContent();
-  const blocks = groupTextItems(tc.items);
+  const pageW = page.view[2]-page.view[0], pageH = page.view[3]-page.view[1];
+  const blocks = groupTextItems(tc.items, page.rotate || 0, pageW, pageH);
   const sizes = blocks.map(b=>b.size);
   const medSize = median(sizes) || 10;
 
@@ -672,12 +689,23 @@ async function extractPage(pdfDoc, pageNum){
       x:x1, y:y1, w:x2-x1, h:y2-y1}));
   }
 
-  // default reading order: top-to-bottom, left-to-right
-  items.sort((a,b)=> (b.y+b.h/2)-(a.y+a.h/2) || a.x-b.x);
+  // default reading order: top-to-bottom, left-to-right in DISPLAY space,
+  // so rotated pages read in the order a reader sees them. Items on the
+  // same visual line (centres within half the smaller height) sort by
+  // horizontal position, so a small fragment cannot jump ahead of its line.
+  const pgGeom = {widthPt: pageW, heightPt: pageH, rotation: page.rotate || 0};
+  const dispC = (it)=>{ const d = itemDisplayRect(it, pgGeom); return {cx: d.x + d.w/2, cy: d.y + d.h/2, h: d.h}; };
+  items.sort((a,b)=>{
+    if (pgGeom.rotation===0) return (b.y+b.h/2)-(a.y+a.h/2) || a.x-b.x;
+    const da = dispC(a), db = dispC(b);
+    const tol = Math.max(2, Math.min(da.h, db.h)*0.5);
+    if (Math.abs(db.cy - da.cy) > tol) return db.cy - da.cy;
+    return da.cx - db.cx;
+  });
   items.forEach((it,i)=>it.order=i);
 
   return { pageNum, pdfPage:page, items,
-    widthPt: page.view[2]-page.view[0], heightPt: page.view[3]-page.view[1],
+    widthPt: pageW, heightPt: pageH,
     rotation: page.rotate || 0 };
 }
 </script>
@@ -3799,14 +3827,17 @@ function createFieldDialog(preset){
   openDialog({title:"Create form field", submitLabel:"Create field",
     bodyHTML:
       selectRow("widget","Field type",[["text","Text field"],["checkbox","Checkbox"],["radio","Radio group"],["dropdown","Dropdown"]],preset||"text")+
-      fieldRow("fname","Field name (internal)","text","",true,"Unique identifier, e.g. full_name.")+
+      fieldRow("fname","Field name (internal)","text","",false,"Unique identifier, e.g. full_name. Leave blank to use the accessible name (spaces become underscores).")+
       fieldRow("tooltip","Accessible name (tooltip)","text",prefillTip,true,"This is what screen readers announce. Required — the tool will not create unnamed fields.")+
       fieldRow("options","Options (radio/dropdown only)","text","",false,"Comma-separated, e.g. Email, Phone, Mail.")+
       `<p class="meta">${replaceTarget ? "The field will replace the selected text object." : (after ? "The field will be placed just below the selected item." : "The field will be placed at the bottom of the page.")}</p>`,
     onSubmit:(v)=>{
-      if (!v.fname.trim() || !v.tooltip.trim()){ announce("Field name and accessible name are both required."); return; }
+      if (!v.tooltip.trim()){ announce("An accessible name is required."); return; }
+      // Internal name: use what was typed, or derive it from the accessible
+      // name so the two stay in sync (e.g. "Participant Name" -> "participant_name").
+      const fname = (v.fname||"").trim() || (v.tooltip||"").trim().toLowerCase().replace(/[^a-z0-9]+/g,"_").replace(/^_+|_+$/g,"") || "field";
       const pg = S.pages[targetPage-1];
-      if (pg.items.some(i=>i.kind==="field" && i.fieldName===v.fname.trim())){
+      if (pg.items.some(i=>i.kind==="field" && i.fieldName===fname)){
         announce("A field with that name already exists."); return;
       }
       pushUndo();
@@ -3853,8 +3884,8 @@ function createFieldDialog(preset){
           const r0 = placeField(oi);
           const newItem = {id:uid("p"+targetPage+"-i"), page:targetPage, kind:"field", role:"Form",
             order:0, artifact:false, url:"", alt:"",
-            text:`Field: ${v.fname.trim()}`, x:r0.x, y:r0.y, w:r0.w, h:r0.h,
-            fieldName:v.fname.trim(), fieldType:"Btn",
+            text:`Field: ${fname}`, x:r0.x, y:r0.y, w:r0.w, h:r0.h,
+            fieldName:fname, fieldType:"Btn",
             widget:"radio", tooltip:`${v.tooltip.trim()}: ${op}`, value:"",
             options:[], isNew:true, optLabel:op, groupLabel:v.tooltip.trim()};
           made.push(newItem); createdIds.push(newItem.id);
@@ -3865,21 +3896,21 @@ function createFieldDialog(preset){
           prevId = newItem.id;
         });
         if (replacing) placeAtReplaced(made);
-        logEvent("Created radio group", `"${v.fname}" with ${names.length} options`);
-        announce(`Radio group "${v.fname}" created with ${names.length} options${replacing?", replacing the selected text":""}.`);
+        logEvent("Created radio group", `"${fname}" with ${names.length} options`);
+        announce(`Radio group "${fname}" created with ${names.length} options${replacing?", replacing the selected text":""}.`);
       } else {
         const r0 = placeField(0);
         const it = {id:uid("p"+targetPage+"-i"), page:targetPage, kind:"field", role:"Form",
           order:0, artifact:false, url:"", alt:"",
-          text:`Field: ${v.fname.trim()}`, x:r0.x, y:r0.y, w:r0.w, h:r0.h,
-          fieldName:v.fname.trim(), fieldType: v.widget==="dropdown"?"Ch":(v.widget==="text"?"Tx":"Btn"),
+          text:`Field: ${fname}`, x:r0.x, y:r0.y, w:r0.w, h:r0.h,
+          fieldName:fname, fieldType: v.widget==="dropdown"?"Ch":(v.widget==="text"?"Tx":"Btn"),
           widget:v.widget, tooltip:v.tooltip.trim(), value:"",
           options:v.options.split(",").map(s=>s.trim()).filter(Boolean), isNew:true};
         createdIds.push(it.id);
         if (replacing) placeAtReplaced([it]);
         else insertAfterRef(pg, it, refItem);
-        logEvent("Created form field", `${v.widget} "${v.fname}" with accessible name "${v.tooltip}"`);
-        announce(`Form field "${v.fname}" created with accessible name${replacing?", replacing the selected text":""}.`);
+        logEvent("Created form field", `${v.widget} "${fname}" with accessible name "${v.tooltip}"`);
+        announce(`Form field "${fname}" created with accessible name${replacing?", replacing the selected text":""}.`);
       }
       if (replacing && createdIds.length){
         // Focus the first new field (without selecting it) so the next action
@@ -4873,10 +4904,14 @@ function taggedPDFDialog(){
   openDialog({title:"Download remediated (tagged) PDF", submitLabel:"Build PDF",
     bodyHTML: fieldRow("title","Document title","text",S.docTitle||S.fileName,true,
       "Written into the PDF metadata. Required for accessibility.")+
-      fieldRow("lang","Document language","text","en-US",true,"Language code, e.g. en-US."),
+      fieldRow("lang","Document language","text","en-US",true,"Language code, e.g. en-US.")+
+      fieldRow("fname","File name","text",(S.fileName||"document")+"-remediated.pdf",true,
+        "The name of the downloaded file. The document title above sets the title inside the PDF, not the file name."),
     onSubmit:(v)=>{
       if(!v.title.trim()){ announce("A document title is required."); return; }
-      buildTaggedPDF(v.title.trim(), (v.lang||"en-US").trim());
+      let outName = (v.fname||"").trim() || ((S.fileName||"document")+"-remediated.pdf");
+      if (!/\.pdf$/i.test(outName)) outName += ".pdf";
+      buildTaggedPDF(v.title.trim(), (v.lang||"en-US").trim(), outName);
     }});
 }
 
@@ -5103,27 +5138,52 @@ function buildAssignments(pg, splitOk){
 
 function wrapRuns(text, runs, assigns){
   // returns {out, matched:[{assign fields..., mcids:[]}]} in reading order
+  // Text is matched by SEARCHING each assignment's normalised text in the
+  // concatenated run text, instead of assuming assignments arrive in
+  // content-stream order. On rotated pages the two orders can disagree
+  // (row-major reading order vs column-major content stream), and the old
+  // sequential matcher then stalled on the first unmatchable block and
+  // tagged nothing after it. Each assignment claims the first occurrence
+  // of its text that no earlier assignment has claimed.
   const matched=[]; // non-artifact assigns that received MCIDs
   const aState=assigns;
-  let ai=0; // current text/cell assignment pointer (reading order)
-  const nextTextAssign=()=>{ while(ai<aState.length&&(aState[ai].done||aState[ai].kind==="image")) ai++;
-    const a=aState[ai]; return (a&&(a.kind==="text"||a.kind==="cell"))?a:null; };
   const nextImageAssign=()=>{
     const cands=aState.filter(a=>!a.done&&a.kind==="image")
       .sort((x,y)=>(x.item.streamIdx||0)-(y.item.streamIdx||0));
     return cands[0]||null;
   };
   const repl=[]; // {start,end,str}
-  let mcid=0, accRuns=[], accText="";
+  let mcid=0;
   const stats={matchedRuns:0,totalRuns:runs.filter(r=>r.kind==="text").length,matchedAssigns:0};
 
-  function flushAccAsArtifact(){
-    for (const r of accRuns) repl.push({start:r.start,end:r.end,
-      str:"/Artifact BMC\n"+r.raw+"\nEMC"});
-    accRuns=[]; accText="";
-  }
-  function commitAcc(a){
-    for (const r of accRuns){
+  // Searchable normalised text over the text runs, with a char->run map.
+  const runNorm = runs.map(r=>r.kind==="text" ? normStr(r.text) : "");
+  let allText = "";
+  const charRun = [];
+  runNorm.forEach((rt,ri)=>{ for (let i=0;i<rt.length;i++) charRun.push(ri); allText += rt; });
+  const claimed = new Uint8Array(allText.length);
+
+  // Text / cell assignments, in reading order.
+  for (const a of aState){
+    if (a.kind!=="text" && a.kind!=="cell") continue;
+    if (a.done) continue;
+    const target = a.norm;
+    if (!target){ a.done=true; continue; } // no searchable text (e.g. underscores): artifact
+    let found = -1, from = 0;
+    while (true){
+      const idx = allText.indexOf(target, from);
+      if (idx<0) break;
+      let overlap = false;
+      for (let i=idx;i<idx+target.length;i++) if (claimed[i]){ overlap=true; break; }
+      if (!overlap){ found = idx; break; }
+      from = idx+1;
+    }
+    if (found<0) continue; // text not present contiguously; leave as artifact
+    for (let i=found;i<found+target.length;i++) claimed[i]=1;
+    const hitRuns = new Set();
+    for (let i=found;i<found+target.length;i++) hitRuns.add(charRun[i]);
+    for (const ri of [...hitRuns].sort((x,y)=>x-y)){
+      const r = runs[ri];
       if (a.role==="Artifact"){
         repl.push({start:r.start,end:r.end,str:"/Artifact BMC\n"+r.raw+"\nEMC"});
       } else {
@@ -5136,11 +5196,11 @@ function wrapRuns(text, runs, assigns){
     }
     a.done=true; stats.matchedAssigns++;
     if (a.role!=="Artifact") matched.push(a);
-    accRuns=[]; accText="";
-    if (a.kind==="text"||a.kind==="cell") ai++;
   }
-
+  // Images (stream order) and every run no assignment claimed -> artifact.
+  const replaced = new Set(repl.map(r=>r.start));
   for (const run of runs){
+    if (replaced.has(run.start)) continue;
     if (run.kind==="image"){
       const a=nextImageAssign();
       if (a){
@@ -5155,21 +5215,8 @@ function wrapRuns(text, runs, assigns){
       }
       continue;
     }
-    const rt=normStr(run.text);
-    if (!rt){ repl.push({start:run.start,end:run.end,str:"/Artifact BMC\n"+run.raw+"\nEMC"}); continue; }
-    accRuns.push(run); accText+=rt;
-    const a=nextTextAssign();
-    if (!a){ flushAccAsArtifact(); continue; }
-    const target=a.norm;
-    if (!target){ flushAccAsArtifact(); a.done=true; ai++; continue; }
-    if (target===accText||target.startsWith(accText)){
-      if (target===accText) commitAcc(a);
-      // else keep accumulating
-    } else {
-      flushAccAsArtifact(); // mismatch: do not consume assignment
-    }
+    repl.push({start:run.start,end:run.end,str:"/Artifact BMC\n"+run.raw+"\nEMC"});
   }
-  flushAccAsArtifact();
   // rebuild stream
   repl.sort((a,b)=>a.start-b.start);
   let out="",pos=0;
