@@ -4562,7 +4562,7 @@ function exportLinkHref(it){
 }
 function buildHTMLString(){
   const title = S.docTitle || S.fileName;
-  let h = `<!DOCTYPE html>\n<html lang="en">\n<head><meta charset="utf-8">\n<title>${escapeHtml(title)}</title>\n</head>\n<body>\n<h1>${escapeHtml(title)}</h1>\n`;
+  let h = `<!DOCTYPE html>\n<html lang="en">\n<head><meta charset="utf-8">\n<title>${escapeHtml(title)}</title>\n<style>\n.print-value { display: none; }\n.save-btn { font-size: 1rem; padding: 0.6rem 1.2rem; cursor: pointer; }\n@media print {\n  .instructions, .save-btn { display: none !important; }\n  input, select { display: none !important; }\n  .print-value { display: inline; }\n}\n</style>\n</head>\n<body>\n<h1>${escapeHtml(title)}</h1>\n`;
   S.pages.forEach(pg=>{
     h += `<section aria-label="Page ${pg.pageNum}" id="page-${pg.pageNum}">\n`;
     const items = pg.items.filter(i=>!i.hidden && !i.artifact).sort((a,b)=>a.order-b.order);
@@ -4589,7 +4589,7 @@ function buildHTMLString(){
     closeList();
     h += `</section>\n`;
   });
-  h += `</body>\n</html>`;
+  h += `<p class="instructions">Fill in any form fields above, then save a copy as a PDF. In the print dialog, choose \u201cSave as PDF\u201d as the destination.</p>\n<p><button type="button" id="save-pdf" class="save-btn">Save as PDF</button></p>\n<script>\nfunction syncPrintValues(){\n  document.querySelectorAll('.fillable-field').forEach(function(f){\n    var span = f.parentElement.querySelector('.print-value');\n    if (!span) return;\n    if (f.type === 'checkbox') span.textContent = f.checked ? 'Checked' : 'Not checked';\n    else if (f.tagName === 'SELECT') span.textContent = f.options[f.selectedIndex] ? f.options[f.selectedIndex].text : '';\n    else span.textContent = f.value;\n  });\n}\ndocument.getElementById('save-pdf').addEventListener('click', function(){ syncPrintValues(); window.print(); });\nwindow.addEventListener('beforeprint', syncPrintValues);\ndocument.querySelectorAll('.fillable-field').forEach(function(f){ f.addEventListener('input', syncPrintValues); f.addEventListener('change', syncPrintValues); });\n<\/script>\n</body>\n</html>`;
   return h;
 }
 function exportHTML(){
@@ -4622,9 +4622,9 @@ function tableToHTML(pg, titem){
 function fieldToHTML(it){
   const label = escapeHtml(it.tooltip||it.fieldName);
   const v = S.filled[it.fieldName];
-  if (it.widget==="text") return `<p><label>${label}<br><input type="text" value="${escapeHtml(v||"")}"></label></p>\n`;
-  if (it.widget==="checkbox") return `<p><label><input type="checkbox"${v?" checked":""}> ${label}</label></p>\n`;
-  if (it.widget==="dropdown") return `<p><label>${label}<br><select>${it.options.map(o=>`<option${v===o?" selected":""}>${escapeHtml(o)}</option>`).join("")}</select></label></p>\n`;
+  if (it.widget==="text") return `<p><label>${label}<br><input type="text" class="fillable-field" value="${escapeHtml(v||"")}"><span class="print-value" aria-hidden="true"></span></label></p>\n`;
+  if (it.widget==="checkbox") return `<p><label><input type="checkbox" class="fillable-field"${v?" checked":""}> ${label}<span class="print-value" aria-hidden="true"></span></label></p>\n`;
+  if (it.widget==="dropdown") return `<p><label>${label}<br><select class="fillable-field">${it.options.map(o=>`<option${v===o?" selected":""}>${escapeHtml(o)}</option>`).join("")}</select><span class="print-value" aria-hidden="true"></span></label></p>\n`;
   return `<p>${label}</p>\n`;
 }
 
