@@ -5162,6 +5162,9 @@ function wrapRuns(text, runs, assigns){
   const charRun = [];
   runNorm.forEach((rt,ri)=>{ for (let i=0;i<rt.length;i++) charRun.push(ri); allText += rt; });
   const claimed = new Uint8Array(allText.length);
+  const runSpan = [];
+  { let pos=0; runNorm.forEach((rt,ri)=>{ runSpan[ri]=[pos, pos+rt.length]; pos+=rt.length; }); }
+  const claimedRuns = new Set(); // run indices already tagged by an assignment
 
   // Text / cell assignments, in reading order.
   for (const a of aState){
@@ -5178,11 +5181,45 @@ function wrapRuns(text, runs, assigns){
       if (!overlap){ found = idx; break; }
       from = idx+1;
     }
-    if (found<0) continue; // text not present contiguously; leave as artifact
+    if (found<0){
+      // Fallback: a merged block (e.g. two signature lines merged into one
+      // paragraph) is not contiguous in the content stream, so match it as
+      // a subsequence — the runs that make up its text, in content order,
+      // allowing other assignments' runs in between.
+      let remaining = target;
+      const hit = [];
+      for (let ri=0; ri<runs.length && remaining.length; ri++){
+        if (claimedRuns.has(ri)) continue;
+        const rt = runNorm[ri];
+        if (!rt) continue;
+        if (remaining.startsWith(rt)){ hit.push(ri); remaining = remaining.slice(rt.length); }
+      }
+      if (remaining.length===0 && hit.length){
+        for (const ri of hit){
+          claimedRuns.add(ri);
+          const cs = runSpan[ri][0], ce = runSpan[ri][1];
+          for (let i=cs;i<ce;i++) claimed[i]=1;
+          const r = runs[ri];
+          if (a.role==="Artifact"){
+            repl.push({start:r.start,end:r.end,str:"/Artifact BMC\n"+r.raw+"\nEMC"});
+          } else {
+            const tag=a.kind==="cell"?a.role:a.role;
+            repl.push({start:r.start,end:r.end,
+              str:"/"+tag+" <</MCID "+mcid+">> BDC\n"+r.raw+"\nEMC"});
+            a.mcids.push(mcid); mcid++;
+          }
+          stats.matchedRuns++;
+        }
+        a.done=true; stats.matchedAssigns++;
+        if (a.role!=="Artifact") matched.push(a);
+      }
+      continue;
+    }
     for (let i=found;i<found+target.length;i++) claimed[i]=1;
     const hitRuns = new Set();
     for (let i=found;i<found+target.length;i++) hitRuns.add(charRun[i]);
     for (const ri of [...hitRuns].sort((x,y)=>x-y)){
+      claimedRuns.add(ri);
       const r = runs[ri];
       if (a.role==="Artifact"){
         repl.push({start:r.start,end:r.end,str:"/Artifact BMC\n"+r.raw+"\nEMC"});
