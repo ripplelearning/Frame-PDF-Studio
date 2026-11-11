@@ -3747,7 +3747,15 @@ function tableOperation(pg, t, op, sel){
    field relative to what they see (display space, rotation applied). On a
    rotated page the two differ: an unrotated 300x22 box displays as a thin
    vertical strip. Convert through display space so a new field lands where it
-   looks like it should. Identity on unrotated pages. */
+   looks like it should. Identity on unrotated pages.
+   Stored rects are NOT all true user-space boxes. Text items come from
+   pdf.js getTextContent, whose transform already carries the text's own
+   rotation: for vertical text the stored rect is transposed (w = text length,
+   h = font size, x/y from the transform origin), NOT the true bbox. Image
+   items (operator-list quad) and existing field annots ARE true user-space
+   bboxes. So the stored->display conversion differs by kind. New fields are
+   stored as true user-space bboxes (the export hands them straight to
+   pdf-lib addToPage), so displayRectToPdf is the true-bbox inverse. */
 function pageRotation(pg){
   if (pg.rotation!==undefined && pg.rotation!==null) return pg.rotation;
   if (pg.pdfPage && pg.pdfPage.rotate) return pg.pdfPage.rotate;
@@ -3756,6 +3764,16 @@ function pageRotation(pg){
 function itemDisplayRect(it, pg){
   const W = pg.widthPt, H = pg.heightPt, R = pageRotation(pg);
   const {x, y, w, h} = it;
+  if (R===0) return {x, y, w, h};
+  if (it.kind==="text"){
+    // Stored rect is the transposed text run: x=e, y=f-fontSize, w=length,
+    // h=fontSize. Display rect keeps length/height and re-anchors by kind.
+    if (R===90) return {x:y+h, y:W-x, w, h};
+    if (R===180) return {x:W-x, y:H-y-h, w, h};
+    if (R===270) return {x:H-y-h, y:x, w, h};
+    return {x, y, w, h};
+  }
+  // Image / field items: stored rect is a true user-space bbox.
   if (R===90) return {x:y, y:W-x-w, w:h, h:w};
   if (R===180) return {x:W-x-w, y:H-y-h, w, h};
   if (R===270) return {x:H-y-h, y:x, w:h, h:w};
