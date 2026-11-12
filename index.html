@@ -4560,9 +4560,10 @@ function exportLinkHref(it){
   if (it.linkType==="dest") return "#doc-"+it.destId;
   return it.url||"";
 }
-function buildHTMLString(){
+function buildHTMLString(lang){
   const title = S.docTitle || S.fileName;
-  let h = `<!DOCTYPE html>\n<html lang="en">\n<head><meta charset="utf-8">\n<title>${escapeHtml(title)}</title>\n<style>\n.print-value { display: none; }\n.save-btn { font-size: 1rem; padding: 0.6rem 1.2rem; cursor: pointer; }\n@media print {\n  .instructions, .save-btn { display: none !important; }\n  body > h1.doc-title { display: none !important; }\n  .field-label { display: none !important; }\n  input, select { display: none !important; }\n  .print-value { display: inline; }\n}\n</style>\n</head>\n<body>\n<h1 class="doc-title">${escapeHtml(title)}</h1>\n`;
+  const docLang = (lang || "en-US").trim() || "en-US";
+  let h = `<!DOCTYPE html>\n<html lang="${escapeHtml(docLang)}">\n<head><meta charset="utf-8">\n<title>${escapeHtml(title)}</title>\n<style>\n.print-value { display: none; }\n.save-btn { font-size: 1rem; padding: 0.6rem 1.2rem; cursor: pointer; }\n@media print {\n  .instructions, .save-btn { display: none !important; }\n  body > h1.doc-title { display: none !important; }\n  .field-label { display: none !important; }\n  input, select { display: none !important; }\n  .print-value { display: inline; }\n}\n</style>\n</head>\n<body>\n<h1 class="doc-title">${escapeHtml(title)}</h1>\n`;
   S.pages.forEach(pg=>{
     h += `<section aria-label="Page ${pg.pageNum}" id="page-${pg.pageNum}">\n`;
     const items = pg.items.filter(i=>!i.hidden && !i.artifact).sort((a,b)=>a.order-b.order);
@@ -4593,9 +4594,18 @@ function buildHTMLString(){
   return h;
 }
 function exportHTML(){
-  downloadFile(S.fileName+"-accessible.html", buildHTMLString(), "text/html");
-  logEvent("Exported accessible HTML");
-  announce("Accessible HTML downloaded.");
+  openDialog({title:"Download accessible HTML", submitLabel:"Download HTML",
+    bodyHTML: fieldRow("lang","Document language","text","en-US",true,"Language code, e.g. en-US. Written into the page as its language.")+
+      fieldRow("fname","File name","text",(S.fileName||"document")+"-accessible.html",true,
+        "The name of the downloaded file."),
+    onSubmit:(v)=>{
+      let outName = (v.fname||"").trim() || ((S.fileName||"document")+"-accessible.html");
+      if (!/\.html?$/i.test(outName)) outName += ".html";
+      const lang = (v.lang||"en-US").trim() || "en-US";
+      downloadFile(outName, buildHTMLString(lang), "text/html");
+      logEvent("Exported accessible HTML");
+      announce("Accessible HTML downloaded.");
+    }});
 }
 function tableToHTML(pg, titem){
   const t = getTable(pg, titem.tableId);
