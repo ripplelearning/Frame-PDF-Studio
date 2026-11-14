@@ -5762,7 +5762,7 @@ async function exportFilledPDF(){
         if (it.tooltip){
           try{
             const pf = form.getField(it.fieldName);
-            pf.acroField.dict.set(PDFLib.PDFName.of("TU"), PDFLib.PDFString.of(it.tooltip));
+            pf.acroField.dict.set(PDFLib.PDFName.of("TU"), PDFLib.PDFHexString.fromText(it.tooltip));
           }catch(e){}
         }
       }catch(e){ console.warn("fill failed for", it.fieldName, e.message); }
@@ -6455,7 +6455,7 @@ function buildTaggedPDF(title, lang, outName, returnBlob){
         const tu = it ? (it.groupId ? effectiveFieldLabel(it)
           : (it.widget==="radio"&&it.groupLabel)?it.groupLabel:it.tooltip) : "";
         if (tu){
-          try{ f.acroField.dict.set(PN("TU"),PDFLib.PDFString.of(tu)); }catch(e){}
+          try{ f.acroField.dict.set(PN("TU"),PDFLib.PDFHexString.fromText(tu)); }catch(e){}
         }
       });
       try{ form.updateFieldAppearances(font); }catch(e){}
@@ -6468,16 +6468,11 @@ function buildTaggedPDF(title, lang, outName, returnBlob){
         d.set(PN("Type"),PN("StructElem")); d.set(PN("S"),PN(SType));
         d.set(PN("P"),parentRef);
         const ka=newArr(); kVals.forEach(v=>ka.push(v)); d.set(PN("K"),ka);
-        d.set(PN("Pg"),pageRef);
+        if(pageRef) d.set(PN("Pg"),pageRef);
         if (extra) for (const [k,v] of Object.entries(extra)) d.set(PN(k),v);
         return e;
       }
-      const pageRefs=(()=>{
-        const pagesDict=ctx.lookup(pdfDoc.catalog.lookup(PN("Pages")));
-        const kids=pagesDict.lookup(PN("Kids")); const out=[];
-        for(let i=0;i<kids.size();i++) out.push(kids.get(i));
-        return out;
-      })();
+      const pageRefs=pdfDoc.getPages().map(p=>p.ref);
 
       const docRef=newDict();
       const docKids=[];
@@ -6680,7 +6675,7 @@ function buildTaggedPDF(title, lang, outName, returnBlob){
         d.set(PN("Type"),PN("StructElem")); d.set(PN("S"),PN(SType));
         d.set(PN("P"),parentRef);
         const ka=newArr(); kVals.forEach(v=>ka.push(v)); d.set(PN("K"),ka);
-        d.set(PN("Pg"),pageRef);
+        if(pageRef) d.set(PN("Pg"),pageRef);
         if (extra) for (const [k,v] of Object.entries(extra)) d.set(PN(k),v);
       }
       function makeAltObj(alt){
