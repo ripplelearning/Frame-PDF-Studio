@@ -232,7 +232,7 @@ const S = {
   pdfDoc: null, pdfFile: null, fileName: "", pages: [],
   currentPage: 1, viewMode: "all", selected: new Set(), issues: [],
   signatures: {},
-  filled: {}, log: [], undoStack: [], redoStack: [], contrastScan: null,
+  filled: {}, log: [], undoStack: [], redoStack: [], contrastScan: null, tabsKnown: false,
   docTitle: "", readingOrder: {}, tables: {}, groups: {},
   dirty: false, saveName: null, saveFormat: null, saveHandle: null,
   accelerators: {},
@@ -531,6 +531,7 @@ async function loadFile(file){  if (file.type !== "application/pdf" && !/\.pdf$/
     }
     S.currentPage = 1;
     await enrichFieldTooltips();
+    await readTabOrder();
     $("workbench").hidden = false;
     setFileStatus(`Loaded ${file.name}: ${S.pdfDoc.numPages} page(s).${metaTitle ? "" : " Warning: the document has no title."}`, !metaTitle);
     logEvent("Opened file", file.name);
@@ -4928,6 +4929,25 @@ function checkDialog(){
   renderIssues(document.getElementById("check-host"));
 }
 
+/* Plain names for Tabs values (PDF 32000-1, Table 150). */
+const TAB_ORDER_NAMES = {R:"row order", C:"column order", A:"annotations order", W:"widget order", S:"structure order"};
+/* Tab-order findings shared by the finish checker and the issues panel.
+   kind "notS": Tabs present but not structure order (Matterhorn 28-009).
+   kind "missing": no Tabs key on a page that has annotations (28-008).
+   A page with no annotations and no Tabs key is not a failure, so it is
+   skipped. Returns [] when the values could not be read on load. */
+function tabOrderFindings(){
+  if (!S.tabsKnown) return [];
+  const out = [];
+  S.pages.forEach(pg=>{
+    if (pg.tabs && pg.tabs !== "S")
+      out.push({page:pg.pageNum, tabs:pg.tabs, kind:"notS"});
+    else if (!pg.tabs && pg.hasAnnots)
+      out.push({page:pg.pageNum, tabs:null, kind:"missing"});
+  });
+  return out;
+}
+
 function runChecker(){
   const issues = [];
   const add = (sev,page,message,itemId)=>issues.push({sev,page,message,itemId});
@@ -5004,6 +5024,24 @@ function runChecker(){
   } else {
     add("info",0,"Contrast has not been checked yet — use the Contrast wizard (Remediation toolbar) to check text contrast (WCAG 1.4.3).");
   }
+  // tab order (WCAG 2.4.3): values read from the page dictionaries on load.
+  if (!S.tabsKnown){
+    add("info",0,"Tab order could not be checked — the file could not be read again.");
+  } else {
+    const tabFindings = tabOrderFindings();
+    tabFindings.forEach(f=>{
+      if (f.kind==="notS")
+        add("warning",f.page,`Tab order is “${f.tabs}” (${TAB_ORDER_NAMES[f.tabs]||"unknown order"}), not structure order. Export a tagged PDF to set tab order to structure order (WCAG 2.4.3).`);
+      else
+        add("warning",f.page,"Page has form fields or annotations but no tab order set. Export a tagged PDF to set tab order to structure order (WCAG 2.4.3).");
+    });
+    if (!tabFindings.length){
+      if (S.pages.some(p=>p.tabs==="S"))
+        add("info",0,"Tab order is set to structure order (WCAG 2.4.3).");
+      else
+        add("info",0,"Tab order does not apply — no page has form fields or annotations.");
+    }
+  }
   S.issues = issues;
   const e = issues.filter(i=>i.sev==="error").length, w = issues.filter(i=>i.sev==="warning").length;
   logEvent("Checker run", `${e} error(s), ${w} warning(s)`);
@@ -5049,6 +5087,25 @@ function detectIssues(){
         manualFix:()=>{ selectIssueItem({page:r.page,itemId:r.itemId}); contrastWizard(); }});
     });
   }
+  // tab order (WCAG 2.4.3): warnings only; the pass case is not an issue.
+  // The fix is the tagged-PDF export, which sets tab order to structure
+  // order automatically — the manual fix opens that export dialog.
+  tabOrderFindings().forEach(f=>{
+    if (f.kind==="notS")
+      add({sev:"warning", page:f.page,
+        title:"Tab order is not structure order",
+        description:`Page ${f.page} sets tab order to “${f.tabs}” (${TAB_ORDER_NAMES[f.tabs]||"unknown order"}), not structure order, so keyboard tabbing does not follow the reading order.`,
+        suggestion:"Export a tagged PDF — export sets tab order to structure order automatically.",
+        canAuto:false,
+        manualFix:()=>{ selectIssueItem({page:f.page}); taggedPDFDialog(); }});
+    else
+      add({sev:"warning", page:f.page,
+        title:"Page with annotations has no tab order set",
+        description:`Page ${f.page} has form fields or annotations but no tab order set, so keyboard tabbing order is undefined.`,
+        suggestion:"Export a tagged PDF — export sets tab order to structure order automatically.",
+        canAuto:false,
+        manualFix:()=>{ selectIssueItem({page:f.page}); taggedPDFDialog(); }});
+  });
   S.pages.forEach(pg=>{
     pg.items.filter(i=>!i.hidden).forEach(it=>{
       if (it.kind==="image" && !it.artifact && !it.alt)
@@ -6337,6 +6394,37 @@ async function enrichFieldTooltips(){
       if (it.kind==="field" && !it.tooltip && tuByName[it.fieldName]) it.tooltip = tuByName[it.fieldName];
     }));
   }catch(e){ console.warn("tooltip enrichment failed:", e.message); }
+}
+/* ----- tab order (WCAG 2.4.3, Matterhorn 28-008, 28-009) -----
+   Read each page dictionary's Tabs value on load with pdf-lib, so the
+   checker can report it without re-reading the file. Export already sets
+   /Tabs to S (structure order) on every page; this is the checker half.
+   pg.tabs: "S" | "R" | "C" | "A" | "W" | null (key missing).
+   pg.hasAnnots: true when the page has a non-empty Annots array.
+   S.tabsKnown is false when the file could not be re-read. */
+async function readTabOrder(){
+  S.tabsKnown = false;
+  try{
+    const pdfDoc = await PDFLib.PDFDocument.load(await pdfBytes());
+    const PN = n=>PDFLib.PDFName.of(n);
+    pdfDoc.getPages().forEach((page, i)=>{
+      const pg = S.pages[i];
+      if (!pg) return;
+      let tabs = null;
+      try{
+        const v = page.node.lookup(PN("Tabs"));
+        if (v) tabs = String(v).replace("/","");
+      }catch(e){}
+      let hasAnnots = false;
+      try{
+        const a = page.node.lookup(PN("Annots"));
+        hasAnnots = !!(a && a instanceof PDFLib.PDFArray && a.size() > 0);
+      }catch(e){}
+      pg.tabs = tabs;
+      pg.hasAnnots = hasAnnots;
+    });
+    S.tabsKnown = true;
+  }catch(e){ console.warn("tab order read failed:", e.message); }
 }
 
 </script>
