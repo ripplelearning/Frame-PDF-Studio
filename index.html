@@ -232,7 +232,7 @@ const S = {
   pdfDoc: null, pdfFile: null, fileName: "", pages: [],
   currentPage: 1, viewMode: "all", selected: new Set(), issues: [],
   signatures: {},
-  filled: {}, log: [], undoStack: [], redoStack: [], contrastScan: null, tabsKnown: false, langKnown: false, docLang: null, displayDocTitleKnown: false, displayDocTitle: null, xmpKnown: false, xmpState: null,
+  filled: {}, log: [], undoStack: [], redoStack: [], contrastScan: null, tabsKnown: false, langKnown: false, docLang: null, displayDocTitleKnown: false, displayDocTitle: null, xmpKnown: false, xmpState: null, linksKnown: false, linkAnnots: [],
   docTitle: "", readingOrder: {}, tables: {}, groups: {},
   dirty: false, saveName: null, saveFormat: null, saveHandle: null,
   accelerators: {},
@@ -535,6 +535,7 @@ async function loadFile(file){  if (file.type !== "application/pdf" && !/\.pdf$/
     await readLanguage();
     await readDisplayDocTitle();
     await readXmpMetadata();
+    await readLinks();
     $("workbench").hidden = false;
     setFileStatus(`Loaded ${file.name}: ${S.pdfDoc.numPages} page(s).${metaTitle ? "" : " Warning: the document has no title."}`, !metaTitle);
     logEvent("Opened file", file.name);
@@ -5126,6 +5127,24 @@ function runChecker(){
     if (!xmpFindingsList.length)
       add("info",0,"XMP metadata is present with the document title (dc:title) and PDF/UA identifier (pdfuaid:part 1) (Matterhorn 06-001, 06-002, 06-003).");
   }
+  // link annotations (Matterhorn 28-011, 28-012): Annots arrays and the
+  // structure tree read on load. A link whose text the user supplied in
+  // the link-text prompt counts as described.
+  if (!S.linksKnown){
+    add("info",0,"Link annotations could not be checked — the file could not be read again.");
+  } else if (!S.linkAnnots.length){
+    add("info",0,"This document has no link annotations.");
+  } else {
+    const lkFindings = linkFindings();
+    lkFindings.forEach(f=>{
+      if (f.kind==="notNested")
+        add("warning",f.page,`Link to ${linkDestLabel(f.rec)} on page ${f.page} is not nested in a Link structure element. Export a tagged PDF to wrap link annotations in Link tags (Matterhorn 28-011).`);
+      else
+        add("warning",f.page,`Link to ${linkDestLabel(f.rec)} on page ${f.page} has no alternate description and no link text, so assistive technology cannot announce where the link goes. Add link text for it (Matterhorn 28-012).`);
+    });
+    if (!lkFindings.length)
+      add("info",0,`Link annotations are nested in Link tags with alternate descriptions (${S.linkAnnots.length} link${S.linkAnnots.length===1?"":"s"}; Matterhorn 28-011, 28-012).`);
+  }
   S.issues = issues;
   const e = issues.filter(i=>i.sev==="error").length, w = issues.filter(i=>i.sev==="warning").length;
   logEvent("Checker run", `${e} error(s), ${w} warning(s)`);
@@ -5248,6 +5267,27 @@ function detectIssues(){
         suggestion:"Export a tagged PDF — export writes the document title into the XMP metadata (dc:title) automatically.",
         canAuto:false,
         manualFix:()=>{ selectIssueItem({page:0}); taggedPDFDialog(); }});
+  });
+  // link annotations (Matterhorn 28-011, 28-012): warnings only; the
+  // pass case is not an issue. 28-011 is fixed by the tagged-PDF
+  // export, which wraps link annotations in Link tags automatically —
+  // the manual fix opens that export dialog. 28-012 is fixed by the
+  // link-text prompt — the manual fix opens it for that link.
+  linkFindings().forEach(f=>{
+    if (f.kind==="notNested")
+      add({sev:"warning", page:f.page,
+        title:"Link annotation not nested in a Link tag",
+        description:`Link to ${linkDestLabel(f.rec)} on page ${f.page} is not nested in a Link structure element, so assistive technology cannot associate the link with the document structure.`,
+        suggestion:"Export a tagged PDF — export wraps link annotations in Link tags automatically.",
+        canAuto:false,
+        manualFix:()=>{ selectIssueItem({page:f.page}); taggedPDFDialog(); }});
+    else
+      add({sev:"warning", page:f.page,
+        title:"Link annotation has no alternate description",
+        description:`Link to ${linkDestLabel(f.rec)} on page ${f.page} has no alternate description in Contents and no visible link text, so assistive technology cannot announce where the link goes.`,
+        suggestion:"Add link text describing the link's destination.",
+        canAuto:false,
+        manualFix:()=>{ selectIssueItem({page:f.page}); setLinkTextDialog(f.rec); }});
   });
   S.pages.forEach(pg=>{
     pg.items.filter(i=>!i.hidden).forEach(it=>{
@@ -6314,7 +6354,7 @@ function buildTaggedPDF(title, lang, outName, returnBlob){
       const docRef=newDict();
       const docKids=[];
       const parentNums=[]; let spKey=0;
-      let totalMatched=0,totalRuns=0;
+      let totalMatched=0,totalRuns=0,totalLinks=0,totalWidgets=0;
 
       for (let pi=0;pi<S.pages.length;pi++){
         const pg=S.pages[pi], page=pdfDoc.getPages()[pi], pageRef=pageRefs[pi];
@@ -6332,6 +6372,12 @@ function buildTaggedPDF(title, lang, outName, returnBlob){
         const ns=ctx.stream(latin1Encode(out));
         page.node.set(PN("Contents"),ctx.register(ns));
         page.node.set(PN("Tabs"),PN("S"));
+
+        // Link annotations on this page, for Link structure elements
+        // (Matterhorn 28-011, 28-012): the source annotation (rectangle,
+        // URI, existing Contents, and any text the user supplied in the
+        // link-text prompt) matched to the model by Annots-array index.
+        const pageLinkAnnots = collectPageLinkAnnots(ctx, page, pg.pageNum);
 
         // structure elements in reading order, with L and Table grouping
         let i=0;
@@ -6397,7 +6443,38 @@ function buildTaggedPDF(title, lang, outName, returnBlob){
             }
             else tag=m.role;
             if (m.actualText) extra=Object.assign(extra||{},{ActualText:makeAltObj(m.actualText)});
-            docKids.push(makeElem(tag,docRef,m.mcids.map(PDFLib.PDFNumber.of),pageRef,extra));
+            // Source link annotation behind this link text: nest the
+            // annotation in this same Link element (OBJR in K, plus a
+            // StructParent entry) instead of creating a second Link
+            // element for it (Matterhorn 28-011). App-created links
+            // (linkType) have no source annotation, so they skip this.
+            let linkAnnot = null;
+            if (tag==="Link" && !m.item.linkType && m.item.url){
+              linkAnnot = pageLinkAnnots.find(a=>!a.claimed && a.uri && a.uri===m.item.url && rectOverlapsItem(a.rect, m.item));
+              if (linkAnnot){
+                linkAnnot.claimed = true;
+                totalLinks++;
+                if (linkAnnot.desc){
+                  extra = Object.assign(extra||{},{Alt:makeAltObj(linkAnnot.desc)});
+                  try{ linkAnnot.dict.set(PN("Contents"),makeAltObj(linkAnnot.desc)); }catch(e){}
+                }
+              }
+            }
+            const kVals = m.mcids.map(PDFLib.PDFNumber.of);
+            let elemRef;
+            if (linkAnnot){
+              const objr=ctx.obj({});
+              objr.set(PN("Type"),PN("OBJR")); objr.set(PN("Obj"),linkAnnot.ref); objr.set(PN("Pg"),pageRef);
+              kVals.push(objr);
+              elemRef = makeElem(tag,docRef,kVals,pageRef,extra);
+              linkAnnot.dict.set(PN("StructParent"),PDFLib.PDFNumber.of(spKey));
+              const va=newArr(); va.push(elemRef);
+              parentNums.push(PDFLib.PDFNumber.of(spKey),va);
+              spKey++;
+            } else {
+              elemRef = makeElem(tag,docRef,kVals,pageRef,extra);
+            }
+            docKids.push(elemRef);
             i++;
           }
         }
@@ -6410,6 +6487,7 @@ function buildTaggedPDF(title, lang, outName, returnBlob){
           for(let ai=0;ai<n;ai++){
             const aref=annots.get(ai); const ad=ctx.lookup(aref);
             if (!ad||!ad.get||String(ad.get(PN("Subtype")))!=="/Widget") continue;
+            totalWidgets++;
             ad.set(PN("StructParent"),PDFLib.PDFNumber.of(spKey));
             try{ // copy accessible name onto the widget itself (some checkers don't follow inheritance)
               const parRef=ad.get(PN("Parent"));
@@ -6424,6 +6502,34 @@ function buildTaggedPDF(title, lang, outName, returnBlob){
             const ka=newArr(); ka.push(objr); fd.set(PN("K"),ka); fd.set(PN("Pg"),pageRef);
             docKids.push(fe);
             const va=newArr(); va.push(fe);
+            parentNums.push(PDFLib.PDFNumber.of(spKey),va);
+            spKey++;
+          }
+          // Link annotations not already nested in a text Link element
+          // above -> their own Link element (Matterhorn 28-011), with
+          // the description as /Alt and /Contents when one exists
+          // (28-012). A link with no supplied, existing, or visible
+          // text gets neither: no description is ever invented.
+          for(let ai=0;ai<n;ai++){
+            const la = pageLinkAnnots.find(a=>a.index===ai && !a.claimed);
+            if (!la) continue;
+            la.claimed = true;
+            const aref=annots.get(ai);
+            if (!aref || typeof aref.objectNumber!=="number") continue;
+            totalLinks++;
+            la.dict.set(PN("StructParent"),PDFLib.PDFNumber.of(spKey));
+            if (la.desc){
+              try{ la.dict.set(PN("Contents"),makeAltObj(la.desc)); }catch(e){}
+            }
+            const objr=ctx.obj({});
+            objr.set(PN("Type"),PN("OBJR")); objr.set(PN("Obj"),aref); objr.set(PN("Pg"),pageRef);
+            const le=newDict(); const ld=ctx.lookup(le);
+            ld.set(PN("Type"),PN("StructElem")); ld.set(PN("S"),PN("Link"));
+            ld.set(PN("P"),docRef);
+            const ka=newArr(); ka.push(objr); ld.set(PN("K"),ka); ld.set(PN("Pg"),pageRef);
+            if (la.desc) ld.set(PN("Alt"),makeAltObj(la.desc));
+            docKids.push(le);
+            const va=newArr(); va.push(le);
             parentNums.push(PDFLib.PDFNumber.of(spKey),va);
             spKey++;
           }
@@ -6523,7 +6629,7 @@ function buildTaggedPDF(title, lang, outName, returnBlob){
       const blob=new Blob([bytes],{type:"application/pdf"});
       if (returnBlob) return blob;
       downloadFile(outName||S.fileName+"-remediated.pdf", blob);
-      logEvent("Tagged PDF exported",`${totalMatched}/${totalRuns} text runs tagged, ${spKey} form widgets tagged`);
+      logEvent("Tagged PDF exported",`${totalMatched}/${totalRuns} text runs tagged, ${totalWidgets} form widgets tagged${totalLinks?`, ${totalLinks} link annotation${totalLinks===1?"":"s"} wrapped in Link tags`:""}`);
       announce(`Remediated PDF downloaded. ${totalMatched} of ${totalRuns} text runs tagged. Verify the result in PAC or Acrobat Pro before delivery.`);
       if (typeof runChecker==="function"){ runChecker(); renderIssues($("finish-results")); }
     }catch(err){
@@ -6724,6 +6830,277 @@ async function readDisplayDocTitle(){
     S.displayDocTitle = raw ? raw.asBoolean() : null;
     S.displayDocTitleKnown = true;
   }catch(e){ console.warn("DisplayDocTitle read failed:", e.message); }
+}
+/* ----- link annotations (Matterhorn 28-011, 28-012) -----
+   Read each page's Annots array on load with pdf-lib, so the checker
+   can report link annotations without re-reading the file. Export wraps
+   them in Link structure elements (see buildTaggedPDF); this is the
+   checker half.
+   S.linkAnnots: one record per /Link annotation:
+     {page, index, refKey, rect, uri, destDesc, contents, nestedInLink,
+      linkText, userText}
+   - index: position in the page's Annots array (shared with export,
+     so the user's link text can be found again there).
+   - nestedInLink: the annotation is referenced by an OBJR under a Link
+     structure element in the document's structure tree.
+   - linkText: the visible text under the annotation's rectangle, if any
+     (real text only — the synthetic "(link)" placeholder does not count).
+   - contents: the annotation's /Contents entry (its alternate
+     description), or "".
+   - userText: text the user supplied in the link-text prompt, or "".
+   S.linksKnown is false when the file could not be re-read. */
+async function readLinks(){
+  S.linksKnown = false; S.linkAnnots = [];
+  try{
+    const pdfDoc = await PDFLib.PDFDocument.load(await pdfBytes());
+    const ctx = pdfDoc.context;
+    const PN = n=>PDFLib.PDFName.of(n);
+    // Indirect references of annotations nested in a Link structure
+    // element, found by walking the structure tree's K entries. K can
+    // be a single value or an array; entries can be MCIDs (numbers),
+    // OBJR dictionaries, or structure elements (direct or referenced).
+    const linkedRefs = new Set();
+    try{
+      const root = pdfDoc.catalog.lookup(PN("StructTreeRoot"));
+      if (root){
+        const refKey = v=>{ try{ return String(v); }catch(e){ return ""; } };
+        const walkK = (k, structType)=>{
+          if (!k) return;
+          if (k instanceof PDFLib.PDFNumber) return; // MCID
+          if (k instanceof PDFLib.PDFArray){
+            for (let i=0;i<k.size();i++) walkK(k.get(i), structType);
+            return;
+          }
+          let d = k;
+          try{ d = ctx.lookup(k); }catch(e){ return; }
+          if (!d || !d.lookup) return;
+          let type = "";
+          try{ const t = d.lookup(PN("Type")); if (t) type = String(t); }catch(e){}
+          if (type === "/OBJR"){
+            if (structType === "/Link"){
+              let obj = null;
+              try{ obj = d.get(PN("Obj")); }catch(e){}
+              if (obj) linkedRefs.add(refKey(obj));
+            }
+            return;
+          }
+          // A structure element (direct or referenced): walk its K.
+          let sName = "";
+          try{ const s = d.lookup(PN("S")); if (s) sName = String(s); }catch(e){}
+          let kk = null;
+          try{ kk = d.lookup(PN("K")); }catch(e){}
+          if (kk) walkK(kk, sName || structType);
+        };
+        walkK(root, "");
+      }
+    }catch(e){ console.warn("link structure walk failed:", e.message); }
+    const strVal = v=>{
+      if (!v) return "";
+      try{ if (v instanceof PDFLib.PDFString) return v.decodeText() || ""; }catch(e){}
+      return "";
+    };
+    pdfDoc.getPages().forEach((page, i)=>{
+      const pg = S.pages[i];
+      if (!pg) return;
+      let annots = null;
+      try{ annots = page.node.lookup(PN("Annots")); }catch(e){}
+      if (!annots || !(annots instanceof PDFLib.PDFArray)) return;
+      for (let ai=0; ai<annots.size(); ai++){
+        let aref = null;
+        try{ aref = annots.get(ai); }catch(e){ continue; }
+        let ad = null;
+        try{ ad = ctx.lookup(aref); }catch(e){ continue; }
+        if (!ad || !ad.lookup) continue;
+        let subtype = "";
+        try{ const st = ad.lookup(PN("Subtype")); if (st) subtype = String(st); }catch(e){}
+        if (subtype !== "/Link") continue;
+        // Destination: URI action, GoTo action, or /Dest on the annot.
+        let uri = "", destDesc = "";
+        try{
+          const act = ad.lookup(PN("A"));
+          if (act && act.lookup){
+            const aS = act.lookup(PN("S"));
+            if (aS && String(aS)==="/URI") uri = strVal(act.lookup(PN("URI")));
+            else if (aS && String(aS)==="/GoTo") destDesc = destText(act.lookup(PN("D")));
+          }
+        }catch(e){}
+        if (!uri && !destDesc){
+          try{
+            const dv = ad.lookup(PN("Dest"));
+            if (dv) destDesc = destText(dv);
+          }catch(e){}
+        }
+        if (!uri && !destDesc) destDesc = "link with no destination";
+        let contents = "";
+        try{ contents = strVal(ad.lookup(PN("Contents"))).trim(); }catch(e){}
+        let rect = [0,0,0,0];
+        try{
+          const r = ad.lookup(PN("Rect"));
+          if (r instanceof PDFLib.PDFArray && r.size()>=4)
+            rect = [0,1,2,3].map(j=>{ const n=r.get(j); return (n && typeof n.asNumber==="function") ? n.asNumber() : Number(n)||0; });
+        }catch(e){}
+        const refKey = (()=>{ try{ return String(aref); }catch(e){ return ""; } })();
+        S.linkAnnots.push({page:pg.pageNum, index:ai, refKey, rect,
+          uri, destDesc, contents,
+          nestedInLink: refKey ? linkedRefs.has(refKey) : false,
+          linkText: linkTextUnderRect(pg.pageNum, rect), userText:""});
+      }
+    });
+    S.linksKnown = true;
+  }catch(e){ console.warn("link annotations read failed:", e.message); }
+}
+/* Human-readable description of a GoTo destination value: a named
+   destination string, or "in-document destination" for an explicit
+   destination array (resolving it to a page number would need the
+   document's name tree and page order, which the checker does not
+   have here). */
+function destText(d){
+  if (!d) return "";
+  try{
+    if (d instanceof PDFLib.PDFString) return `destination \u201c${d.decodeText()}\u201d`;
+    if (d instanceof PDFLib.PDFName) return `destination \u201c${String(d).replace("/","")}\u201d`;
+    if (d instanceof PDFLib.PDFArray) return "in-document destination";
+  }catch(e){}
+  return "in-document destination";
+}
+/* Visible text under a rectangle on a page of the loaded model. Real
+   text only — the synthetic "(link)" placeholder does not count as
+   link text. A text block counts when its centre falls inside the
+   rectangle (the same test extractPage uses) OR when its bounding box
+   intersects the rectangle: a link often covers only part of a longer
+   line, whose centre then lies outside the link rectangle even though
+   link text is plainly there (e.g. a URL inside a sentence). */
+function linkTextUnderRect(pageNum, rect){
+  const pg = S.pages[pageNum-1];
+  if (!pg) return "";
+  const [x1,y1,x2,y2] = rect;
+  const hits = pg.items.filter(it=>{
+    if (it.kind!=="text") return false;
+    const t = (it.text||"").trim();
+    if (!t || t==="(link)") return false;
+    const cx = it.x+it.w/2, cy = it.y+it.h/2;
+    if (cx>=x1&&cx<=x2&&cy>=y1&&cy<=y2) return true;
+    const ox = Math.min(it.x+it.w, x2) - Math.max(it.x, x1);
+    const oy = Math.min(it.y+it.h, y2) - Math.max(it.y, y1);
+    return ox>=1 && oy>=1;
+  }).sort((a,b)=>a.order-b.order);
+  return hits.length ? hits.map(h=>h.text.trim()).join(" ").replace(/\s+/g," ").trim() : "";
+}
+/* Whether a model item's centre falls inside an annotation rectangle
+   (same test extractPage and linkTextUnderRect use). */
+function rectOverlapsItem(rect, it){
+  const [x1,y1,x2,y2] = rect;
+  const cx = it.x+it.w/2, cy = it.y+it.h/2;
+  return cx>=x1&&cx<=x2&&cy>=y1&&cy<=y2;
+}
+/* Short destination label for checker and issue messages: the URI, or
+   the destination description. Truncated so a very long URL does not
+   flood a screen reader. */
+function linkDestLabel(rec){
+  const d = rec.uri || rec.destDesc || "link";
+  return d.length > 120 ? d.slice(0,117)+"\u2026" : d;
+}
+/* Link findings shared by the finish checker and the issues panel.
+   kind "notNested": the annotation is not referenced by an OBJR under
+   a Link structure element (28-011). kind "noAlt": no alternate
+   description in Contents and no link text available — neither the
+   annotation's Contents, nor visible link text, nor text the user
+   supplied in the link-text prompt (28-012). Returns [] when the
+   values could not be read on load. */
+function linkFindings(){
+  if (!S.linksKnown) return [];
+  const out = [];
+  S.linkAnnots.forEach(rec=>{
+    if (!rec.nestedInLink) out.push({page:rec.page, kind:"notNested", rec});
+    if (!rec.contents && !rec.linkText && !rec.userText)
+      out.push({page:rec.page, kind:"noAlt", rec});
+  });
+  return out;
+}
+/* Prompt for a link's alternate description (the text a screen reader
+   announces for the link). Mirrors setNameDialog: the visible link
+   text, when there is any, is offered as a one-click candidate, or the
+   user types the description. The text is stored on the annotation
+   record and written as the annotation's /Contents and the Link
+   element's /Alt on tagged-PDF export. Nothing is invented: a link
+   with no supplied, existing, or visible text is left undescribed and
+   stays flagged by the checker. */
+function setLinkTextDialog(rec){
+  if (!rec){ announce("No link annotation to describe."); return; }
+  const dest = linkDestLabel(rec);
+  const candHtml = rec.linkText
+    ? `<fieldset><legend>Use the visible link text as the description</legend>`+
+      `<label class="field" style="font-weight:400"><input type="radio" name="linkcand" data-f="linkcand" value="0" style="width:auto"> \u201c${escapeHtml(rec.linkText.slice(0,80))}\u201d</label></fieldset>`
+    : "<p>No visible link text found \u2014 type the description below.</p>";
+  openDialog({title:"Set link text", submitLabel:"Save link text",
+    bodyHTML:`<p><strong>Link to ${escapeHtml(dest)} (page ${rec.page})</strong></p>
+      <p>Describe where this link goes, in the words a screen reader should announce. Pick the visible text, or type the description yourself:</p>
+      ${candHtml}
+      ${fieldRow("linktext","Or type the link text","text",rec.userText||rec.contents||"","",
+        "For example, \u201cAnnual report (PDF)\u201d. The text is written into the exported PDF; leave it blank only to skip this link for now.")}`,
+    onSubmit:(v)=>{
+      let text = (v.linktext||"").trim();
+      if (!text && v.linkcand!==undefined && v.linkcand!=="" && rec.linkText)
+        text = rec.linkText.trim();
+      if (!text){ announce("No link text chosen."); return; }
+      pushUndo();
+      rec.userText = text;
+      logEvent("Set link text", `${dest} (page ${rec.page}) \u2192 \u201c${text}\u201d`);
+      announce(`Link text set to \u201c${text.slice(0,60)}\u201d.`);
+      renderObjectList(); renderIssuesPanel();
+    }});
+}
+/* One record per /Link annotation on a page of the PDF being exported,
+   for the Link structure elements buildTaggedPDF writes. index is the
+   annotation's position in the page's Annots array — the same index
+   readLinks() recorded, so the user's link text can be found again.
+   desc: the description to write as /Alt and /Contents — the text the
+   user supplied in the link-text prompt, else the annotation's existing
+   Contents, else the visible text under the annotation. Empty when
+   none of those exists: no description is ever invented. */
+function collectPageLinkAnnots(ctx, page, pageNum){
+  const PN = n=>PDFLib.PDFName.of(n);
+  const out = [];
+  let annots = null;
+  try{ annots = ctx.lookup(page.node.get(PN("Annots"))); }catch(e){}
+  if (!annots || !(annots instanceof PDFLib.PDFArray)) return out;
+  const strVal = v=>{
+    if (!v) return "";
+    try{ if (v instanceof PDFLib.PDFString) return v.decodeText() || ""; }catch(e){}
+    return "";
+  };
+  for (let ai=0; ai<annots.size(); ai++){
+    let aref = null;
+    try{ aref = annots.get(ai); }catch(e){ continue; }
+    let ad = null;
+    try{ ad = ctx.lookup(aref); }catch(e){ continue; }
+    if (!ad || !ad.lookup) continue;
+    let subtype = "";
+    try{ const st = ad.lookup(PN("Subtype")); if (st) subtype = String(st); }catch(e){}
+    if (subtype !== "/Link") continue;
+    let uri = "";
+    try{
+      const act = ad.lookup(PN("A"));
+      if (act && act.lookup){
+        const aS = act.lookup(PN("S"));
+        if (aS && String(aS)==="/URI") uri = strVal(act.lookup(PN("URI")));
+      }
+    }catch(e){}
+    let contents = "";
+    try{ contents = strVal(ad.lookup(PN("Contents"))).trim(); }catch(e){}
+    let rect = [0,0,0,0];
+    try{
+      const r = ad.lookup(PN("Rect"));
+      if (r instanceof PDFLib.PDFArray && r.size()>=4)
+        rect = [0,1,2,3].map(j=>{ const n=r.get(j); return (n && typeof n.asNumber==="function") ? n.asNumber() : Number(n)||0; });
+    }catch(e){}
+    const rec = (S.linkAnnots||[]).find(r=>r.page===pageNum && r.index===ai);
+    const userText = rec ? (rec.userText||"") : "";
+    const visibleText = rec ? (rec.linkText||"") : linkTextUnderRect(pageNum, rect);
+    out.push({index:ai, ref:aref, dict:ad, rect, uri,
+      desc: userText || contents || visibleText, claimed:false});
+  }
+  return out;
 }
 
 </script>
