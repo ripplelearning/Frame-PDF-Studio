@@ -232,7 +232,7 @@ const S = {
   pdfDoc: null, pdfFile: null, fileName: "", pages: [],
   currentPage: 1, viewMode: "all", selected: new Set(), issues: [],
   signatures: {},
-  filled: {}, log: [], undoStack: [], redoStack: [], contrastScan: null, tabsKnown: false, langKnown: false, docLang: null, displayDocTitleKnown: false, displayDocTitle: null, xmpKnown: false, xmpState: null, linksKnown: false, linkAnnots: [], tableScopeKnown: false, tableScope: [], tableScopeTables: 0,
+  filled: {}, log: [], undoStack: [], redoStack: [], contrastScan: null, tabsKnown: false, langKnown: false, docLang: null, displayDocTitleKnown: false, displayDocTitle: null, xmpKnown: false, xmpState: null, linksKnown: false, linkAnnots: [], tableScopeKnown: false, tableScope: [], tableScopeTables: 0, charMapKnown: false, charMap: [], charMapFontsChecked: 0,
   docTitle: "", readingOrder: {}, tables: {}, groups: {},
   dirty: false, saveName: null, saveFormat: null, saveHandle: null,
   accelerators: {},
@@ -537,6 +537,7 @@ async function loadFile(file){  if (file.type !== "application/pdf" && !/\.pdf$/
     await readXmpMetadata();
     await readLinks();
     await readTableScope();
+    await readCharMap();
     $("workbench").hidden = false;
     setFileStatus(`Loaded ${file.name}: ${S.pdfDoc.numPages} page(s).${metaTitle ? "" : " Warning: the document has no title."}`, !metaTitle);
     logEvent("Opened file", file.name);
@@ -1097,6 +1098,20 @@ function median(a){ const s=[...a].sort((x,y)=>x-y); return s[Math.floor(s.lengt
 async function extractPage(pdfDoc, pageNum){
   const page = await pdfDoc.getPage(pageNum);
   const tc = await page.getTextContent();
+  // Garbled extraction (Matterhorn 10-001 fallback): when a font has no
+  // usable Unicode mapping, pdf.js extracts control characters or
+  // replacement characters instead of readable text (verified: a Type0
+  // font with its ToUnicode CMap stripped extracts as control codes).
+  // Real document text never contains these characters, so any hit
+  // means a screen reader cannot read that text. Count them so the
+  // finding can say whether one character or the whole text is affected.
+  let garbledCount = 0;
+  for (const it of tc.items){
+    if (typeof it.str !== "string") continue;
+    const hits = it.str.match(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\uFFFD]/g);
+    if (hits) garbledCount += hits.length;
+  }
+  const garbledText = garbledCount > 0;
   const pageW = page.view[2]-page.view[0], pageH = page.view[3]-page.view[1];
   // Operator list, fetched once: the image scan and the text-color
   // extraction (contrast) both walk it.
@@ -1196,7 +1211,7 @@ async function extractPage(pdfDoc, pageNum){
   });
   items.forEach((it,i)=>it.order=i);
 
-  return { pageNum, pdfPage:page, items,
+  return { pageNum, pdfPage:page, items, garbledText, garbledCount,
     widthPt: pageW, heightPt: pageH,
     rotation: page.rotate || 0 };
 }
@@ -5161,6 +5176,29 @@ function runChecker(){
     if (!tsFindings.length && S.tableScopeTables>0)
       add("info",0,"Table header cells carry a Scope attribute (Row or Column) (Matterhorn 15-003).");
   }
+  // character mapping (Matterhorn 10-001): fonts used by rendered text
+  // must map character codes to Unicode, via a ToUnicode CMap or a
+  // standard encoding. Text in a font with no mapping cannot be read
+  // by a screen reader at all, and it cannot be fixed in FRAME — the
+  // document must be re-exported from its source application with
+  // proper font encoding.
+  if (!S.charMapKnown){
+    add("info",0,"Character mapping could not be checked — the file could not be read again.");
+  } else {
+    const cmFindings = charMapFindings();
+    cmFindings.forEach(f=>{
+      if (f.kind==="garbled"){
+        const msg = (f.count||0)===1
+          ? `1 character on page ${f.page} extracts as an unreadable control character instead of readable text, so a screen reader cannot read that character. This cannot be fixed in FRAME — re-export the document from its source application with proper font encoding (Matterhorn 10-001).`
+          : `${f.count||"Some"} characters on page ${f.page} extract as unreadable control characters, so a screen reader cannot read that text reliably. This cannot be fixed in FRAME — re-export the document from its source application with proper font encoding (Matterhorn 10-001).`;
+        add("warning",f.page,msg);
+      }
+      else
+        add("warning",f.page,`Text set in font “${f.font}” on page ${f.page} has no Unicode mapping (${f.why||"it has no ToUnicode entry"}), so a screen reader cannot read that text at all. This cannot be fixed in FRAME — re-export the document from its source application with proper font encoding (Matterhorn 10-001).`);
+    });
+    if (!cmFindings.length && S.charMapFontsChecked>0)
+      add("info",0,"All fonts used by rendered text map character codes to Unicode (Matterhorn 10-001).");
+  }
   S.issues = issues;
   const e = issues.filter(i=>i.sev==="error").length, w = issues.filter(i=>i.sev==="warning").length;
   logEvent("Checker run", `${e} error(s), ${w} warning(s)`);
@@ -5317,6 +5355,28 @@ function detectIssues(){
       suggestion:"Make the table in FRAME with header rows/columns designated (select its cells and use Make table, or Edit table), then export a tagged PDF — export writes Scope (Row or Column) on header cells automatically.",
       canAuto:false,
       manualFix:()=>{ selectIssueItem({page:f.page}); taggedPDFDialog(); }});
+  });
+  // character mapping (Matterhorn 10-001): warnings only; the pass
+  // case is not an issue. There is deliberately NO fix action here —
+  // no "Fix manually" button and no automatic fix: FRAME cannot
+  // repair a missing Unicode mapping. The only remedy is to
+  // re-export the document from its source application with proper
+  // font encoding, then load the new file here.
+  charMapFindings().forEach(f=>{
+    if (f.kind==="garbled")
+      add({sev:"warning", page:f.page,
+        title:(f.count||0)===1 ? "A character extracts as an unreadable control character" : "Text extracts as garbled characters",
+        description:(f.count||0)===1
+          ? `1 character on page ${f.page} extracts as an unreadable control character instead of readable text, so a screen reader cannot read that character.`
+          : `${f.count||"Some"} characters on page ${f.page} extract as unreadable control characters, so a screen reader cannot read that text reliably.`,
+        suggestion:"This cannot be fixed in FRAME. Re-export the document from its source application with proper font encoding, then load the new file here.",
+        canAuto:false});
+    else
+      add({sev:"warning", page:f.page,
+        title:"Font has no Unicode mapping",
+        description:`Text set in font “${f.font}” on page ${f.page} has no Unicode mapping (${f.why||"it has no ToUnicode entry"}), so a screen reader cannot read that text at all.`,
+        suggestion:"This cannot be fixed in FRAME. Re-export the document from its source application with proper font encoding, then load the new file here.",
+        canAuto:false});
   });
   S.pages.forEach(pg=>{
     pg.items.filter(i=>!i.hidden).forEach(it=>{
@@ -5481,15 +5541,20 @@ function renderIssuesPanel(){
       });
       btnRow.appendChild(auto);
     }
-    const man = document.createElement("button");
-    man.textContent = "Fix manually";
-    man.style.marginLeft = is.canAuto ? "8px" : "0";
-    man.setAttribute("aria-label", `Fix manually: ${is.title}. Opens a dialog to repair this issue.`);
-    man.addEventListener("click", ()=>{
-      pendingIssueFocus = idx;
-      is.manualFix();
-    });
-    btnRow.appendChild(man);
+    // Entries with no fix in FRAME (character mapping, Matterhorn
+    // 10-001) carry no manualFix and get no button: a button that
+    // pretends a fix exists would be a lie.
+    if (is.manualFix){
+      const man = document.createElement("button");
+      man.textContent = "Fix manually";
+      man.style.marginLeft = is.canAuto ? "8px" : "0";
+      man.setAttribute("aria-label", `Fix manually: ${is.title}. Opens a dialog to repair this issue.`);
+      man.addEventListener("click", ()=>{
+        pendingIssueFocus = idx;
+        is.manualFix();
+      });
+      btnRow.appendChild(man);
+    }
     li.appendChild(btnRow);
     ul.appendChild(li);
   });
@@ -7096,6 +7161,250 @@ async function readTableScope(){
 function tableScopeFindings(){
   if (!S.tableScopeKnown) return [];
   return S.tableScope || [];
+}
+/* ----- character mapping (Matterhorn 10-001) -----
+   A character code that cannot be mapped to Unicode cannot be read by
+   a screen reader at all, and no other remediation matters. Read on
+   load with pdf-lib, so the checker can report it without re-reading
+   the file. For each page, the decoded content stream is scanned for
+   the fonts actually used by rendered text (a font selected with Tf
+   that a text-showing operator then uses); each used font dictionary
+   is checked for a usable Unicode mapping:
+     - a /ToUnicode CMap maps the codes: pass;
+     - a composite (Type0) font whose /Encoding is a predefined UCS2
+       CMap (…-UCS2-H/V) maps its CIDs to Unicode: pass, otherwise
+       fail — CIDs without ToUnicode have no Unicode mapping;
+     - a simple font whose /Encoding is a standard encoding
+       (WinAnsi, MacRoman, Standard, MacExpert, PDFDoc) maps its codes
+       through that encoding: pass, unless the font is symbolic
+       (FontDescriptor Flags bit 4), whose codes select glyphs from
+       the font's own built-in encoding instead;
+     - a simple font whose /Encoding dictionary has a /Differences
+       array maps its codes through the glyph names: pass only when
+       the base encoding is standard (or absent) and every difference
+       name is a standard Adobe Glyph List name or a uni/u code
+       (custom names such as g12 carry no Unicode meaning);
+     - a simple font with no /Encoding entry falls back to its
+       built-in encoding: pass, unless symbolic.
+   A font that is never used by rendered text is never flagged, and a
+   font whose dictionary cannot be resolved is skipped (unknown, never
+   a finding). The check deliberately does NOT treat "no ToUnicode"
+   alone as a failure: most ordinary PDFs (a WinAnsi Helvetica, a
+   MacRoman Type1) carry no ToUnicode entry and are perfectly
+   readable through their encoding — flagging them would drown the
+   real failures.
+   S.charMap: one record per (font, page) with no usable mapping:
+     {page, kind:"unmapped", font, reason, why} (font is the BaseFont
+     with any 6-letter subset prefix stripped; why is a plain-language
+     reason phrase), plus one {page, kind:"garbled", count} per page
+     whose extracted text came back garbled (count is the number of
+     unreadable characters found on the page; see extractPage), added
+     only when no unmapped font already explains that page.
+   S.charMapFontsChecked counts the (font, page) pairs examined.
+   S.charMapKnown is false when the file could not be re-read.
+   There is no fix in FRAME: the document must be re-exported from
+   its source application with proper font encoding. */
+const CHARMAP_STANDARD_ENCODINGS = new Set(["/WinAnsiEncoding","/MacRomanEncoding","/StandardEncoding","/MacExpertEncoding","/PDFDocEncoding"]);
+// Standard Adobe Glyph List names a /Differences entry may use and still
+// map to Unicode (letters, digits, punctuation, Latin-1, ligatures,
+// Greek, and common symbols). A name outside this set — or a uni/u code
+// such as uni00E9 — is handled by isMappableGlyphName below.
+const CHARMAP_AGL_NAMES = new Set(("A B C D E F G H I J K L M N O P Q R S T U V W X Y Z a b c d e f g h i j k l m n o p q r s t u v w x y z zero one two three four five six seven eight nine space exclam quotedbl numbersign dollar percent ampersand quotesingle parenleft parenright asterisk plus comma hyphen period slash colon semicolon less equal greater question at bracketleft backslash bracketright asciicircum underscore grave braceleft bar braceright asciitilde bullet Euro sterling yen cent currency florin quotesinglbase quotedblbase quotedblleft quotedblright quoteleft quoteright guilsinglleft guilsinglright guillemotleft guillemotright endash emdash dagger daggerdbl perthousand ellipsis trademark copyright registered degree plusminus minus multiply divide fraction onesuperior twosuperior threesuperior onehalf onequarter threequarters fi fl ffi ffl ff dotlessi AE OE ae oe Agrave Aacute Acircumflex Atilde Adieresis Aring Ccedilla Egrave Eacute Ecircumflex Edieresis Igrave Iacute Icircumflex Idieresis Eth Ntilde Ograve Oacute Ocircumflex Otilde Odieresis Oslash Ugrave Uacute Ucircumflex Udieresis Yacute Thorn germandbls agrave aacute acircumflex atilde adieresis aring ccedilla egrave eacute ecircumflex edieresis igrave iacute icircumflex idieresis eth ntilde ograve oacute ocircumflex otilde odieresis oslash ugrave uacute ucircumflex udieresis yacute ytilde thorn ydieresis Scaron scaron Zcaron zcaron Ccaron ccaron Ncaron ncaron Amacr amacr Emacr emacr Imacr imacr Omacr omacr Umacr umacr Aogonek aogonek Eogonek eogonek Iogonek iogonek Uogonek uogonek Abreve abreve Ebreve ebreve Gbreve gbreve Cacute cacute Lacute lacute Nacute nacute Sacute sacute Zacute zacute Cdot cdot Edot edot Gdot gdot Idot idot Zdot zdot Hbar hbar Tbar tbar Lslash lslash Dbar dbar Ohungarumlaut ohungarumlaut Uhungarumlaut uhungarumlaut Ecaron ecaron Rcaron rcaron Uring uring Scedilla scedilla Tcedilla tcedilla Gcommaaccent gcommaaccent Kcommaaccent kcommaaccent Lcommaaccent lcommaaccent Ncommaaccent ncommaaccent Rcommaaccent rcommaaccent Scommaaccent scommaaccent Tcommaaccent tcommaaccent exclamdown questiondown ordmasculine ordfeminine section paragraph macron acute cedilla dieresis circumflex tilde ring breve caron ogonek hungarumlaut mu Alpha Beta Gamma Delta Epsilon Zeta Eta Theta Iota Kappa Lambda Mu Nu Xi Omicron Pi Rho Sigma Tau Upsilon Phi Chi Psi Omega alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma sigma1 tau upsilon phi chi psi omega infinity integral partialdiff summation product arrowleft arrowright arrowup arrowdown arrowboth checkmark logicalnot brokenbar").split(" "));
+function isMappableGlyphName(name){
+  if (!name) return false;
+  if (name===".notdef") return true; // no glyph rendered for this code
+  if (/^uni[0-9A-Fa-f]{4,6}$/.test(name) || /^u[0-9A-Fa-f]{4,6}$/.test(name)) return true;
+  return CHARMAP_AGL_NAMES.has(name);
+}
+/* True when the font's descriptor marks it symbolic (Flags bit 4):
+   its character codes select glyphs from its own built-in encoding
+   and carry no Unicode meaning on their own. */
+function isSymbolicFont(fontDict, ctx, PN){
+  try{
+    const desc = fontDict.lookup(PN("FontDescriptor"));
+    if (!desc) return false;
+    const d = ctx.lookup(desc);
+    if (!d || !d.lookup) return false;
+    const flags = d.lookup(PN("Flags"));
+    if (!flags || typeof flags.asNumber!=="function") return false;
+    return (flags.asNumber() & 4) !== 0;
+  }catch(e){ return false; }
+}
+/* {mapped, reason} for one font dictionary. reason is a short code for
+   the finding text: "tounicode" | "ucs2" | "encoding" |
+   "differences" (mapped) or "type0" | "symbolic" |
+   "custom-differences" | "custom-encoding" (unmapped). */
+function fontMappingStatus(fontDict, ctx, PN){
+  let tu = null;
+  try{ tu = fontDict.lookup(PN("ToUnicode")); }catch(e){}
+  if (tu) return {mapped:true, reason:"tounicode"};
+  let subtype = "";
+  try{ const s = fontDict.lookup(PN("Subtype")); if (s) subtype = String(s); }catch(e){}
+  let enc = null;
+  try{ enc = fontDict.lookup(PN("Encoding")); }catch(e){}
+  if (subtype==="/Type0"){
+    const encName = enc ? String(enc) : "";
+    if (/UCS2-[HV]$/.test(encName)) return {mapped:true, reason:"ucs2"};
+    return {mapped:false, reason:"type0"};
+  }
+  if (enc && enc instanceof PDFLib.PDFDict){
+    let base = "";
+    try{ const b = enc.lookup(PN("BaseEncoding")); if (b) base = String(b); }catch(e){}
+    let diffs = null;
+    try{ diffs = enc.lookup(PN("Differences")); }catch(e){}
+    const names = [];
+    if (diffs && diffs instanceof PDFLib.PDFArray){
+      for (let i=0;i<diffs.size();i++){
+        const v = diffs.get(i);
+        if (v instanceof PDFLib.PDFName) names.push(String(v).replace("/",""));
+      }
+    }
+    const baseOk = !base || CHARMAP_STANDARD_ENCODINGS.has(base);
+    if (baseOk && names.every(isMappableGlyphName)) return {mapped:true, reason:"differences"};
+    return {mapped:false, reason:"custom-differences"};
+  }
+  if (enc){
+    const encName = String(enc);
+    if (CHARMAP_STANDARD_ENCODINGS.has(encName)){
+      if (isSymbolicFont(fontDict, ctx, PN)) return {mapped:false, reason:"symbolic"};
+      return {mapped:true, reason:"encoding"};
+    }
+    return {mapped:false, reason:"custom-encoding"};
+  }
+  if (isSymbolicFont(fontDict, ctx, PN)) return {mapped:false, reason:"symbolic"};
+  return {mapped:true, reason:"encoding"};
+}
+/* Page Resources dictionary, walking up the page tree: a page
+   inherits its parent Pages node's Resources when it has none of
+   its own. Returns null when no Resources dictionary is found. */
+function pageResourcesDict(ctx, pageNode, PN){
+  let node = pageNode, guard = 0;
+  while (node && node.lookup && guard++ < 20){
+    let r = null;
+    try{ r = node.lookup(PN("Resources")); }catch(e){}
+    if (r){
+      try{ const d = ctx.lookup(r); if (d && d.lookup) return d; }catch(e){}
+      return null;
+    }
+    let parent = null;
+    try{ parent = node.lookup(PN("Parent")); }catch(e){}
+    if (!parent) return null;
+    try{ node = ctx.lookup(parent); }catch(e){ return null; }
+  }
+  return null;
+}
+/* Resource names of the fonts actually used by rendered text in one
+   decoded content stream: the font selected by a Tf operator at the
+   moment a text-showing operator (Tj, TJ, ', ") runs. Literal and hex
+   strings are blanked first, so text contents cannot fake operators.
+   (Inline-image data between ID and EI is not blanked; a byte
+   sequence there that both spells a Tf operator and names a real
+   font resource is vanishingly unlikely.) */
+function usedFontNamesInContent(text){
+  const blanked = [];
+  let i = 0;
+  while (i < text.length){
+    const c = text[i];
+    if (c==="("){
+      let depth = 1, j = i+1;
+      blanked.push(" ");
+      while (j < text.length && depth > 0){
+        if (text[j]==="\\"){ blanked.push("  "); j += 2; continue; }
+        if (text[j]==="(") depth++;
+        else if (text[j]===")") depth--;
+        blanked.push(" ");
+        j++;
+      }
+      i = j;
+    } else if (c==="<" && text[i+1]!=="<"){
+      let j = i+1;
+      blanked.push(" ");
+      while (j < text.length && text[j]!==">"){ blanked.push(" "); j++; }
+      if (j < text.length){ blanked.push(" "); j++; }
+      i = j;
+    } else {
+      blanked.push(c);
+      i++;
+    }
+  }
+  const clean = blanked.join("");
+  const used = new Set();
+  let current = null;
+  const re = /\/([^\s\[\]()<>/{ }%]+)\s+[0-9.]+\s+Tf\b|\bTj\b|\bTJ\b|'|"/g;
+  let m;
+  while ((m = re.exec(clean)) !== null){
+    if (m[1] !== undefined) current = m[1];
+    else if (current) used.add(current);
+  }
+  return used;
+}
+/* Plain-language reason phrases for an unmapped font, keyed by the
+   fontMappingStatus reason code. */
+const CHARMAP_WHY = {
+  "type0": "its Identity-H encoding carries no Unicode mapping and it has no ToUnicode entry",
+  "symbolic": "it is a symbolic font with no ToUnicode entry",
+  "custom-differences": "its encoding uses custom glyph names with no Unicode meaning",
+  "custom-encoding": "its encoding is not a standard encoding and it has no ToUnicode entry",
+};
+async function readCharMap(){
+  S.charMapKnown = false; S.charMap = []; S.charMapFontsChecked = 0;
+  try{
+    const pdfDoc = await PDFLib.PDFDocument.load(await pdfBytes());
+    const ctx = pdfDoc.context;
+    const PN = n=>PDFLib.PDFName.of(n);
+    pdfDoc.getPages().forEach((page, i)=>{
+      const pg = S.pages[i];
+      if (!pg) return;
+      let used = new Set();
+      try{
+        const info = pageContentsInfo(ctx, page);
+        if (info && info.bytes && info.bytes.length){
+          let text = "";
+          try{ text = new TextDecoder("latin1").decode(info.bytes); }catch(e){}
+          if (text) used = usedFontNamesInContent(text);
+        }
+      }catch(e){ console.warn("character mapping content scan failed:", e.message); }
+      if (!used.size) return;
+      let res = null;
+      try{ res = pageResourcesDict(ctx, page.node, PN); }catch(e){}
+      let fontDict = null;
+      try{ fontDict = res ? res.lookup(PN("Font")) : null; }catch(e){}
+      if (!fontDict) return;
+      let fonts = null;
+      try{ fonts = ctx.lookup(fontDict); }catch(e){}
+      if (!fonts || !fonts.lookup) return;
+      let unmappedOnPage = false;
+      used.forEach(name=>{
+        let fd = null;
+        try{ fd = ctx.lookup(fonts.get(PN(name))); }catch(e){}
+        if (!fd || !fd.lookup) return; // unresolvable: unknown, never a finding
+        S.charMapFontsChecked++;
+        let st = null;
+        try{ st = fontMappingStatus(fd, ctx, PN); }catch(e){}
+        if (!st || st.mapped) return;
+        unmappedOnPage = true;
+        let baseFont = "";
+        try{ const b = fd.lookup(PN("BaseFont")); if (b) baseFont = String(b).replace("/",""); }catch(e){}
+        const display = baseFont.replace(/^[A-Z]{6}\+/, "") || name;
+        S.charMap.push({page:pg.pageNum, kind:"unmapped", font:display, reason:st.reason, why:CHARMAP_WHY[st.reason]||"it has no ToUnicode entry"});
+      });
+      // Garbled extraction with no unmapped font to explain it: the
+      // mapping looked usable on paper but the text still comes back
+      // unreadable (for example a broken ToUnicode CMap).
+      if (!unmappedOnPage && pg.garbledText)
+        S.charMap.push({page:pg.pageNum, kind:"garbled", count:pg.garbledCount||0});
+    });
+    S.charMapKnown = true;
+  }catch(e){ console.warn("character mapping read failed:", e.message); }
+}
+/* Character-mapping findings shared by the finish checker and the
+   issues panel. One entry per (font, page) with no usable Unicode
+   mapping, plus one per page whose text extracts garbled without an
+   unmapped font to explain it. Returns [] when the values could not
+   be read on load, or when every used font maps to Unicode. */
+function charMapFindings(){
+  if (!S.charMapKnown) return [];
+  return S.charMap || [];
 }
 /* Human-readable description of a GoTo destination value: a named
    destination string, or "in-document destination" for an explicit
