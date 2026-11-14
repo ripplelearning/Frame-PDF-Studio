@@ -161,6 +161,7 @@ kbd{background:var(--panel);border:1px solid var(--line);border-radius:4px;paddi
         <button id="mact-title">Set document title</button>
         <button id="mact-ocr-doc">Run OCR on this document</button>
         <button id="mact-a11y-wizard" class="primary">Accessibility wizard</button>
+        <button id="mact-contrast-wizard">Contrast wizard</button>
         <button id="mact-propagate">Propagate label</button>
         <button id="mact-colsort">Sort reading order</button>
         <button id="mact-progress">Remediation progress</button>
@@ -231,7 +232,7 @@ const S = {
   pdfDoc: null, pdfFile: null, fileName: "", pages: [],
   currentPage: 1, viewMode: "all", selected: new Set(), issues: [],
   signatures: {},
-  filled: {}, log: [], undoStack: [], redoStack: [],
+  filled: {}, log: [], undoStack: [], redoStack: [], contrastScan: null,
   docTitle: "", readingOrder: {}, tables: {}, groups: {},
   dirty: false, saveName: null, saveFormat: null, saveHandle: null,
   accelerators: {},
@@ -451,6 +452,7 @@ function doUndo(){
   if (!S.undoStack.length) return;
   S.redoStack.push(snapshotModel());
   restoreSnapshot(S.undoStack.pop());
+  S.contrastScan = null; // cached ratios predate the undo
   logEvent("Undo"); announce("Undone.");
   updateUndoButtons();
   renderIssuesPanelSafe();
@@ -460,6 +462,7 @@ function doRedo(){
   if (!S.redoStack.length) return;
   S.undoStack.push(snapshotModel());
   restoreSnapshot(S.redoStack.pop());
+  S.contrastScan = null; // cached ratios predate the redo
   logEvent("Redo"); announce("Redone.");
   updateUndoButtons();
   renderIssuesPanelSafe();
@@ -517,6 +520,7 @@ async function loadFile(file){  if (file.type !== "application/pdf" && !/\.pdf$/
     S.pdfDoc = await pdfjsLib.getDocument({data: buf}).promise;
     S.fileName = file.name.replace(/\.pdf$/i,"");
     S.pages = []; S.selected.clear(); S.log = []; S.undoStack = []; S.redoStack = [];
+    S.contrastScan = null;
     S.filled = loadFilled(S.fileName);
     let metaTitle = "";
     try{ const md = await S.pdfDoc.getMetadata(); metaTitle = (md.info && md.info.Title) || ""; }catch(e){}
@@ -545,12 +549,467 @@ function setFileStatus(msg, isAlert){
   el.setAttribute("role", isAlert ? "alert" : "status");
 }
 
+/* ---------- contrast (WCAG 1.4.3): text color, background, ratio ----------
+   Conservative by design: a pass is only claimed when both the text color
+   and a solid background were determined. Anything else is reported as
+   "could not determine" or, for image/gradient backgrounds, as a range.
+   All results are plain text (ratios, color names, hex). No data leaves
+   the device: detection renders pages locally with pdf.js. */
+function rgbToHex(c){
+  if (!c) return "";
+  const p = v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2,"0").toUpperCase();
+  return "#"+p(c.r)+p(c.g)+p(c.b);
+}
+function hexToRgb(hex){
+  if (typeof hex !== "string") return null;
+  const h = hex.trim().replace(/^#/,"");
+  if (!/^[0-9A-Fa-f]{3}$/.test(h) && !/^[0-9A-Fa-f]{6}$/.test(h)) return null;
+  const full = h.length===3 ? h.split("").map(c=>c+c).join("") : h;
+  return {r:parseInt(full.slice(0,2),16), g:parseInt(full.slice(2,4),16), b:parseInt(full.slice(4,6),16)};
+}
+const COLOR_NAMES = [
+  ["black",0,0,0],["white",255,255,255],["dark gray",38,38,38],["gray",128,128,128],
+  ["light gray",211,211,211],["very light gray",235,235,235],["silver",192,192,192],
+  ["red",255,0,0],["dark red",139,0,0],["maroon",128,0,0],["orange",255,165,0],
+  ["light orange",245,168,97],["gold",201,162,39],["dark gold",122,74,0],
+  ["yellow",255,255,0],["light yellow",255,255,224],["brown",165,42,42],
+  ["green",0,128,0],["dark green",0,100,0],["light green",144,238,144],
+  ["blue",0,0,255],["dark blue",0,0,139],["navy",0,0,128],["light blue",173,216,230],
+  ["purple",128,0,128],["dark purple",41,9,82],["pink",255,192,203],
+  ["teal",0,128,128],["cyan",0,255,255],["magenta",255,0,255],
+];
+function colorName(c){
+  if (!c) return "unknown color";
+  let best=null, bestD=Infinity;
+  for (const [name,r,g,b] of COLOR_NAMES){
+    const d=(c.r-r)*(c.r-r)+(c.g-g)*(c.g-g)+(c.b-b)*(c.b-b);
+    if (d<bestD){ bestD=d; best=name; }
+  }
+  return bestD<=110*110 ? best : "custom color";
+}
+function formatColor(c){ return c ? `${colorName(c)} ${rgbToHex(c)}` : "could not determine"; }
+/* WCAG relative luminance (sRGB, 0-255 channels) and contrast ratio. */
+function relativeLuminance(c){
+  const lin = v => { const s=v/255; return s<=0.03928 ? s/12.92 : Math.pow((s+0.055)/1.055, 2.4); };
+  return 0.2126*lin(c.r) + 0.7152*lin(c.g) + 0.0722*lin(c.b);
+}
+function contrastRatio(fg, bg){
+  const l1=relativeLuminance(fg), l2=relativeLuminance(bg);
+  const hi=Math.max(l1,l2), lo=Math.min(l1,l2);
+  return (hi+0.05)/(lo+0.05);
+}
+function requiredRatioFor(it){
+  const size = it.fontSize || 10;
+  const bold = !!it.bold;
+  const large = size>=18 || (size>=14 && bold);
+  return {required: large?3:4.5, large, size, bold};
+}
+/* A color as it must be written back into the content stream to restore the
+   original color after a fix: same operator family (rg/g/k, or RG/G/K for
+   stroked text) with the original components. */
+function formatColorOp(old, stroke){
+  if (!old || !old.comps) return null;
+  const f = v => { const s=(+v).toFixed(4).replace(/0+$/,"").replace(/\.$/,""); return s===""?"0":s; };
+  if (old.space==="gray") return f(old.comps[0])+(stroke?" G":" g");
+  if (old.space==="cmyk") return old.comps.slice(0,4).map(f).join(" ")+(stroke?" K":" k");
+  return old.comps.slice(0,3).map(f).join(" ")+(stroke?" RG":" rg");
+}
+/* Original color of a text item, in restorable form, or null. */
+function colorToRestore(fillColor){
+  if (!fillColor) return null;
+  if (fillColor.comps) return {space: fillColor.space||"rgb", comps: fillColor.comps};
+  return {space:"rgb", comps:[fillColor.r/255, fillColor.g/255, fillColor.b/255]};
+}
+/* {newOp, oldOp} for a contrast fix, or null when the fix cannot be
+   applied safely (missing hex or missing original color). */
+function colorOpsForFix(fix){
+  if (!fix || !fix.hex || !fix.old) return null;
+  const n = hexToRgb(fix.hex); if (!n) return null;
+  const oldOp = formatColorOp(fix.old, !!fix.stroke); if (!oldOp) return null;
+  const f = v => (+v).toFixed(3);
+  const op = fix.stroke ? "RG" : "rg";
+  return {newOp:`${f(n.r/255)} ${f(n.g/255)} ${f(n.b/255)} ${op}`, oldOp};
+}
+/* Suggest a fix color: move the foreground toward black, then toward white,
+   keeping its hue; return the closest color that meets the required ratio
+   against the given background, or black/white as a fallback. */
+function suggestFixColor(fg, bg, required){
+  const passes = c => contrastRatio(c, bg) >= required;
+  const dist = c => (c.r-fg.r)*(c.r-fg.r)+(c.g-fg.g)*(c.g-fg.g)+(c.b-fg.b)*(c.b-fg.b);
+  const cands = [];
+  for (let t=1;t<=40;t++){
+    const f=t/40;
+    const dark={r:Math.round(fg.r*(1-f)), g:Math.round(fg.g*(1-f)), b:Math.round(fg.b*(1-f))};
+    if (passes(dark)){ cands.push(dark); break; }
+  }
+  for (let t=1;t<=40;t++){
+    const f=t/40;
+    const light={r:Math.round(fg.r+(255-fg.r)*f), g:Math.round(fg.g+(255-fg.g)*f), b:Math.round(fg.b+(255-fg.b)*f)};
+    if (passes(light)){ cands.push(light); break; }
+  }
+  if (!cands.length){
+    if (passes({r:0,g:0,b:0})) cands.push({r:0,g:0,b:0});
+    else if (passes({r:255,g:255,b:255})) cands.push({r:255,g:255,b:255});
+  }
+  if (!cands.length) return null;
+  cands.sort((a,b)=>dist(a)-dist(b));
+  const rgb=cands[0];
+  return {rgb, hex:rgbToHex(rgb), ratio:contrastRatio(rgb, bg)};
+}
+/* Suggest a fix color for text on an image/gradient background: the color
+   must pass against BOTH the darkest and the lightest sampled background
+   points. Returns null when no single color can (the background spans too
+   much range) — then the step says so instead of guessing. */
+function suggestFixColorAgainst(fg, bg, required){
+  const passesBoth = c => contrastRatio(c, bg.minColor)>=required && contrastRatio(c, bg.maxColor)>=required;
+  const dist = c => (c.r-fg.r)*(c.r-fg.r)+(c.g-fg.g)*(c.g-fg.g)+(c.b-fg.b)*(c.b-fg.b);
+  const cands=[];
+  for (let t=1;t<=40;t++){
+    const f=t/40;
+    const dark={r:Math.round(fg.r*(1-f)), g:Math.round(fg.g*(1-f)), b:Math.round(fg.b*(1-f))};
+    if (passesBoth(dark)){ cands.push(dark); break; }
+  }
+  for (let t=1;t<=40;t++){
+    const f=t/40;
+    const light={r:Math.round(fg.r+(255-fg.r)*f), g:Math.round(fg.g+(255-fg.g)*f), b:Math.round(fg.b+(255-fg.b)*f)};
+    if (passesBoth(light)){ cands.push(light); break; }
+  }
+  if (!cands.length){
+    if (passesBoth({r:0,g:0,b:0})) cands.push({r:0,g:0,b:0});
+    else if (passesBoth({r:255,g:255,b:255})) cands.push({r:255,g:255,b:255});
+  }
+  if (!cands.length) return null;
+  cands.sort((a,b)=>dist(a)-dist(b));
+  const rgb=cands[0];
+  return {rgb, hex:rgbToHex(rgb), ratio:Math.min(contrastRatio(rgb,bg.minColor), contrastRatio(rgb,bg.maxColor))};
+}
+
+/* Walk a page's operator list and track the current fill/stroke color, so
+   each text-content item gets the color it was drawn with. Handles RGB,
+   gray, CMYK, and the DeviceRGB/DeviceGray/DeviceCMYK named color spaces;
+   anything else (Pattern, ICCBased, Separation, …) is "could not determine".
+   Returns one entry per text-content item: {color, unknown, mixed, bold}.
+   color is {r,g,b,space,comps} in 0-255 RGB plus the original color-space
+   components for a faithful restore, or null. */
+function extractTextColors(ops, tcItems){
+  const OPS = pdfjsLib.OPS;
+  // PDF default: stroking and nonstroking colors start as black, so text
+  // drawn before any explicit color operator is black — not "unknown".
+  // (A form whose body text precedes its first color operator is common.)
+  let fill={space:"rgb", comps:[0,0,0]}, stroke={space:"rgb", comps:[0,0,0]},
+      fillSpace="rgb", strokeSpace="rgb", mode=0;
+  const stream=[]; // {ch, color} — color null when unknown, {invisible:true} when not drawn
+  const compList = a => {
+    if (a==null) return [];
+    if (typeof a==="number") return [a];
+    if (typeof a==="string") return [a];
+    try{ return Array.from(a); }catch(e){ return [a]; }
+  };
+  // pdf.js 3.11 passes RGB components as 0-255 ints; other producers give
+  // 0-1 floats. A non-integer value means 0-1 scale; pure 0/1 values are
+  // identical in both scales, so the ambiguity never matters.
+  const toUnit = vals => {
+    const scaled = vals.some(v=>typeof v==="number" && !Number.isInteger(v));
+    return vals.map(v=> scaled ? v : v/255);
+  };
+  const spaceOf = a => {
+    const v = Array.isArray(a) ? a[0] : a;
+    if (v==="DeviceRGB") return "rgb";
+    if (v==="DeviceGray") return "gray";
+    if (v==="DeviceCMYK") return "cmyk";
+    return null;
+  };
+  const rgbFrom = state => {
+    if (!state || !state.comps) return null;
+    if (state.space==="rgb" && state.comps.length>=3)
+      return {r:Math.round(state.comps[0]*255), g:Math.round(state.comps[1]*255), b:Math.round(state.comps[2]*255), space:"rgb", comps:state.comps.slice(0,3)};
+    if (state.space==="gray" && state.comps.length>=1){
+      const g=Math.round(state.comps[0]*255);
+      return {r:g, g, b:g, space:"gray", comps:state.comps.slice(0,1)};
+    }
+    if (state.space==="cmyk" && state.comps.length>=4){
+      const [c,m,y,k]=state.comps;
+      return {r:Math.round(255*(1-c)*(1-k)), g:Math.round(255*(1-m)*(1-k)), b:Math.round(255*(1-y)*(1-k)), space:"cmyk", comps:state.comps.slice(0,4)};
+    }
+    return null;
+  };
+  const setColor = (args, which) => {
+    const vals = compList(args);
+    if (vals.length===1 && typeof vals[0]==="string" && vals[0].startsWith("#")){
+      const c = hexToRgb(vals[0]);
+      if (!c) return;
+      const st = {space:"rgb", comps:[c.r/255, c.g/255, c.b/255]};
+      if (which==="fill"){ fill=st; fillSpace="rgb"; } else { stroke=st; strokeSpace="rgb"; }
+      return;
+    }
+    const nums = vals.filter(v=>typeof v==="number");
+    if (!nums.length) return;
+    const space = which==="fill" ? fillSpace : strokeSpace;
+    if (space==="rgb" && nums.length>=3){
+      const st={space:"rgb", comps:toUnit(nums.slice(0,3))};
+      if (which==="fill") fill=st; else stroke=st;
+    } else if (space==="gray" && nums.length>=1){
+      const st={space:"gray", comps:toUnit(nums.slice(0,1))};
+      if (which==="fill") fill=st; else stroke=st;
+    } else if (space==="cmyk" && nums.length>=4){
+      const st={space:"cmyk", comps:toUnit(nums.slice(0,4))};
+      if (which==="fill") fill=st; else stroke=st;
+    } else if (space===null){
+      // No color space set (unusual): assume the components are RGB.
+      const st={space:"rgb", comps:toUnit(nums.slice(0,3))};
+      if (which==="fill") fill=st; else stroke=st;
+    }
+  };
+  for (let i=0;i<ops.fnArray.length;i++){
+    const fn=ops.fnArray[i], args=ops.argsArray[i];
+    if (fn===OPS.setFillRGBColor){ const v=compList(args); fill={space:"rgb", comps:toUnit(v.slice(0,3))}; fillSpace="rgb"; }
+    else if (fn===OPS.setFillGray){ const v=compList(args); fill={space:"gray", comps:toUnit(v.slice(0,1))}; fillSpace="gray"; }
+    else if (fn===OPS.setFillCMYKColor){ const v=compList(args); fill={space:"cmyk", comps:toUnit(v.slice(0,4))}; fillSpace="cmyk"; }
+    else if (fn===OPS.setFillColorSpace){ fillSpace=spaceOf(compList(args)); fill=null; }
+    else if (fn===OPS.setFillColor){ setColor(args, "fill"); }
+    else if (fn===OPS.setStrokeRGBColor){ const v=compList(args); stroke={space:"rgb", comps:toUnit(v.slice(0,3))}; strokeSpace="rgb"; }
+    else if (fn===OPS.setStrokeGray){ const v=compList(args); stroke={space:"gray", comps:toUnit(v.slice(0,1))}; strokeSpace="gray"; }
+    else if (fn===OPS.setStrokeCMYKColor){ const v=compList(args); stroke={space:"cmyk", comps:toUnit(v.slice(0,4))}; strokeSpace="cmyk"; }
+    else if (fn===OPS.setStrokeColorSpace){ strokeSpace=spaceOf(compList(args)); stroke=null; }
+    else if (fn===OPS.setStrokeColor){ setColor(args, "stroke"); }
+    else if (fn===OPS.setTextRenderingMode){ mode=(compList(args)[0]|0)||0; }
+    else if (fn===OPS.showText || fn===OPS.showSpacedText){
+      const glyphs = compList(args)[0];
+      if (!glyphs || typeof glyphs.length!=="number") continue;
+      for (const g of glyphs){
+        if (typeof g==="number") continue; // kerning adjustment, not a glyph
+        const uni = g && typeof g.unicode==="string" ? g.unicode : (typeof g==="string" ? g : "");
+        if (!uni) continue;
+        let color;
+        if (mode===3 || mode===7) color={invisible:true};
+        else if (mode===1) color=rgbFrom(stroke);
+        else color=rgbFrom(fill);
+        stream.push({ch:uni, color, stroke:mode===1});
+      }
+    }
+  }
+  // Align the glyph stream to the text-content items. Both come from the same
+  // content stream in the same order; whitespace is ignored on both sides,
+  // and a forward resync recovers from small mismatches (ligatures, spacing).
+  const glyphChars=[];
+  for (const g of stream){
+    for (const ch of g.ch){ if (!/\s/.test(ch)) glyphChars.push({ch, color:g.color, stroke:g.stroke}); }
+  }
+  const out=[];
+  let p=0;
+  const matchAt=(chars,start)=>{
+    if (start+chars.length>glyphChars.length) return false;
+    for (let k=0;k<chars.length;k++) if (glyphChars[start+k].ch!==chars[k]) return false;
+    return true;
+  };
+  tcItems.forEach((item,idx)=>{
+    const bold=/bold/i.test(item.fontName||"");
+    const chars=[...(item.str||"")].filter(c=>!/\s/.test(c));
+    if (!chars.length){ out.push({color:null, unknown:false, empty:true, bold}); return; }
+    let at=-1;
+    if (matchAt(chars,p)) at=p;
+    else {
+      for (let s=p+1; s<=Math.min(glyphChars.length-chars.length, p+500); s++){
+        if (glyphChars[s].ch===chars[0] && matchAt(chars,s)){ at=s; break; }
+      }
+    }
+    if (at<0){ out.push({color:null, unknown:true, bold}); return; }
+    const cols=glyphChars.slice(at, at+chars.length);
+    p=at+chars.length;
+    if (cols.some(g=>g.color && g.color.invisible)){ out.push({color:null, unknown:true, invisible:true, bold}); return; }
+    const known=cols.filter(g=>g.color);
+    if (known.length<cols.length){ out.push({color:null, unknown:true, bold}); return; }
+    if (!known.length){ out.push({color:null, unknown:true, bold}); return; }
+    const first=known[0].color;
+    const mixed=known.some(g=>g.color.r!==first.r||g.color.g!==first.g||g.color.b!==first.b);
+    const stroke=known.every(g=>g.stroke);
+    out.push({color:mixed?null:first, unknown:false, mixed, bold, stroke});
+  });
+  return out;
+}
+
+/* Render one page to an offscreen canvas for background sampling. */
+async function renderPageForContrast(pdfPage){
+  const scale=2;
+  const viewport=pdfPage.getViewport({scale});
+  const canvas=document.createElement("canvas");
+  canvas.width=Math.ceil(viewport.width); canvas.height=Math.ceil(viewport.height);
+  await pdfPage.render({canvasContext:canvas.getContext("2d"), viewport}).promise;
+  return {canvas, ctx:canvas.getContext("2d"), scale, width:canvas.width, height:canvas.height};
+}
+/* Sample the background behind one text item from the rendered page.
+   The item's display rect is y-up; canvas pixels are y-down from the top.
+   Samples a ring just outside the text box plus an interior grid, skipping
+   pixels that match the foreground color (the glyphs themselves). Returns
+   {type:"solid",color} when at least 80% of samples agree, otherwise
+   {type:"image"|"gradient",minColor,maxColor}. Returns null when too few
+   pixels could be sampled. */
+function sampleBackground(pg, render, item, fg){
+  const d=itemDisplayRect(item, pg);
+  const R=pageRotation(pg);
+  const dispH=(R===90||R===270)?pg.widthPt:pg.heightPt;
+  const s=render.scale;
+  const pad=Math.max(3, Math.round(d.h*s*0.15));
+  const x0=Math.max(0, Math.floor(d.x*s-pad)), y0=Math.max(0, Math.floor((dispH-d.y-d.h)*s-pad));
+  const x1=Math.min(render.width, Math.ceil((d.x+d.w)*s+pad)), y1=Math.min(render.height, Math.ceil((dispH-d.y)*s+pad));
+  if (x1-x0<2 || y1-y0<2) return null;
+  let img;
+  try{ img=render.ctx.getImageData(x0, y0, x1-x0, y1-y0); }catch(e){ return null; }
+  const px=(x,y)=>{ const o=((y-y0)*img.width+(x-x0))*4; return {r:img.data[o], g:img.data[o+1], b:img.data[o+2], a:img.data[o+3]}; };
+  const pts=[];
+  const step=4;
+  for (let x=x0;x<x1;x+=step){ pts.push([x,y0]); pts.push([x,y1-1]); }
+  for (let y=y0;y<y1;y+=step){ pts.push([x0,y]); pts.push([x1-1,y]); }
+  const insetX=Math.max(2, Math.round(d.w*s*0.12)), insetY=Math.max(2, Math.round(d.h*s*0.15));
+  for (let gx=0;gx<6;gx++) for (let gy=0;gy<4;gy++){
+    pts.push([Math.round(x0+pad+insetX+gx*(d.w*s-2*insetX)/5), Math.round(y0+pad+insetY+gy*(d.h*s-2*insetY)/3)]);
+  }
+  const nearFg=(c,ref)=>Math.abs(c.r-ref.r)<36 && Math.abs(c.g-ref.g)<36 && Math.abs(c.b-ref.b)<36;
+  const samples=[];
+  for (const [x,y] of pts){
+    if (x<x0||x>=x1||y<y0||y>=y1) continue;
+    const c=px(x,y);
+    if (c.a<128) continue;
+    if (fg && nearFg(c,fg)) continue;
+    samples.push(c);
+  }
+  if (samples.length<4) return null;
+  const med=a=>{ const s2=[...a].sort((x,y)=>x-y); return s2[Math.floor(s2.length/2)]; };
+  const median={r:med(samples.map(c=>c.r)), g:med(samples.map(c=>c.g)), b:med(samples.map(c=>c.b))};
+  // Drop anti-aliased glyph-edge pixels: blends of the foreground color and
+  // the median background. Without this, edge pixels (e.g. purple-grey
+  // blends around dark-purple underscores) pollute the background sample
+  // and a solid white background reads as an image.
+  let usable=samples;
+  if (fg){
+    const blendFiltered=samples.filter(c=>{
+      let best=Infinity, bestT=0;
+      for (let a=0;a<=10;a++){
+        const t=a/10;
+        const r=fg.r+(median.r-fg.r)*t, g=fg.g+(median.g-fg.g)*t, b=fg.b+(median.b-fg.b)*t;
+        const d=Math.max(Math.abs(c.r-r), Math.abs(c.g-g), Math.abs(c.b-b));
+        if (d<best){ best=d; bestT=t; }
+      }
+      // Interior blends only: pure background (t near 1) and pure foreground
+      // (t near 0, already excluded above) are kept.
+      return !(best<=28 && bestT>0.15 && bestT<0.85);
+    });
+    if (blendFiltered.length>=4) usable=blendFiltered;
+  }
+  const median2={r:med(usable.map(c=>c.r)), g:med(usable.map(c=>c.g)), b:med(usable.map(c=>c.b))};
+  const inliers=usable.filter(c=>Math.abs(c.r-median2.r)<=12 && Math.abs(c.g-median2.g)<=12 && Math.abs(c.b-median2.b)<=12);
+  if (inliers.length/usable.length>=0.8) return {type:"solid", color:median2};
+  let minC=usable[0], maxC=usable[0];
+  for (const c of usable){
+    if (relativeLuminance(c)<relativeLuminance(minC)) minC=c;
+    if (relativeLuminance(c)>relativeLuminance(maxC)) maxC=c;
+  }
+  // Image or gradient? An image item overlapping the text means image.
+  let isImage=false;
+  const pgItems=(pg.items||[]).filter(i=>i.kind==="image" && !i.hidden);
+  for (const im of pgItems){
+    const id=itemDisplayRect(im, pg);
+    const ox=Math.min(d.x+d.w, id.x+id.w)-Math.max(d.x, id.x);
+    const oy=Math.min(d.y+d.h, id.y+id.h)-Math.max(d.y, id.y);
+    if (ox>0 && oy>0 && ox*oy > 0.25*d.w*d.h){ isImage=true; break; }
+  }
+  return {type:isImage?"image":"gradient", minColor:{r:minC.r,g:minC.g,b:minC.b}, maxColor:{r:maxC.r,g:maxC.g,b:maxC.b}};
+}
+
+/* Full-document contrast scan. Results are cached on S.contrastScan so the
+   checker and the issues panel can report them; the wizard re-scans fresh
+   on every open, and the scan is cleared on undo/redo/load. */
+async function scanContrast(){
+  if (!S.pages.length){ announce("Load a PDF first."); return null; }
+  const results=[];
+  for (const pg of S.pages){
+    setFileStatus(`Checking contrast, page ${pg.pageNum} of ${S.pages.length} …`);
+    let render=null;
+    try{ render=await renderPageForContrast(pg.pdfPage); }catch(e){ console.warn("contrast render failed", e); }
+    for (const it of pg.items){
+      if (it.kind!=="text" || it.hidden || it.artifact) continue;
+      if (it.role==="Link" && (it.text||"").trim()==="(link)") continue; // synthetic link placeholder, not real text
+      const text=(it.editedText || it.text || "").trim();
+      if (!text) continue;
+      const req=requiredRatioFor(it);
+      const base={itemId:it.id, page:pg.pageNum, text, size:Math.round(req.size*10)/10, bold:req.bold, required:req.required, large:req.large};
+      let fg=null;
+      if (it.contrastFix){ fg=hexToRgb(it.contrastFix.hex); }
+      else if (it.fillMixed){
+        results.push({...base, status:"undetermined", reason:"This text uses more than one color, so no single ratio applies.", fg:null, bg:null});
+        continue;
+      }
+      else if (it.fillColor){ fg={r:it.fillColor.r, g:it.fillColor.g, b:it.fillColor.b}; }
+      if (!fg){
+        results.push({...base, status:"undetermined", reason:"The text color could not be determined from the file.", fg:null, bg:null});
+        continue;
+      }
+      if (!render){
+        results.push({...base, status:"undetermined", reason:"The page could not be rendered to check the background.", fg, bg:null});
+        continue;
+      }
+      const bg=sampleBackground(pg, render, it, fg);
+      if (!bg){
+        results.push({...base, status:"undetermined", reason:"The background behind this text could not be sampled.", fg, bg:null});
+        continue;
+      }
+      if (bg.type==="solid"){
+        const ratio=contrastRatio(fg, bg.color);
+        const status=ratio>=req.required?"pass":"fail";
+        results.push({...base, status, ratio, fg, bg, stroke:!!it.colorIsStroke,
+          suggested:status==="fail"?suggestFixColor(fg, bg.color, req.required):null});
+      } else {
+        const lo=Math.min(contrastRatio(fg,bg.minColor), contrastRatio(fg,bg.maxColor));
+        const hi=Math.max(contrastRatio(fg,bg.minColor), contrastRatio(fg,bg.maxColor));
+        results.push({...base, status:"range", ratioLo:lo, ratioHi:hi, fg, bg, stroke:!!it.colorIsStroke,
+          suggested:suggestFixColorAgainst(fg, bg, req.required)});
+      }
+    }
+  }
+  const counts={pass:0, fail:0, range:0, undetermined:0};
+  results.forEach(r=>{ if (counts[r.status]!==undefined) counts[r.status]++; });
+  S.contrastScan={at:new Date().toISOString(), results, counts};
+  setFileStatus(`Contrast check done: ${counts.fail} failing, ${counts.range} on image or gradient backgrounds, ${counts.undetermined} could not be determined, ${counts.pass} passing.`);
+  logEvent("Contrast scan", `${counts.fail} fail, ${counts.range} image/gradient, ${counts.undetermined} undetermined, ${counts.pass} pass`);
+  announce(`Contrast check finished: ${counts.fail} text runs fail, ${counts.range} are on image or gradient backgrounds, ${counts.undetermined} could not be determined, ${counts.pass} pass.`);
+  renderIssuesPanelSafe();
+  return S.contrastScan;
+}
+/* After fixes are applied (or undone), refresh the cached scan from the
+   stored background data — no re-render needed, the background is unchanged. */
+function refreshContrastScanAfterFix(){
+  if (!S.contrastScan) return;
+  S.contrastScan.results.forEach(r=>{
+    const it=itemById(r.itemId); if (!it) return;
+    if (it.artifact){ r.status="decorative"; return; }
+    const fg=it.contrastFix?hexToRgb(it.contrastFix.hex):r.fg;
+    if (!fg || !r.bg) return;
+    r.fg=fg;
+    if (r.bg.type==="solid"){
+      r.ratio=contrastRatio(fg, r.bg.color);
+      r.status=r.ratio>=r.required?"pass":"fail";
+    } else {
+      r.ratioLo=Math.min(contrastRatio(fg,r.bg.minColor), contrastRatio(fg,r.bg.maxColor));
+      r.ratioHi=Math.max(contrastRatio(fg,r.bg.minColor), contrastRatio(fg,r.bg.maxColor));
+      r.status="range";
+    }
+  });
+  const counts={pass:0, fail:0, range:0, undetermined:0};
+  S.contrastScan.results.forEach(r=>{ if (counts[r.status]!==undefined) counts[r.status]++; });
+  S.contrastScan.counts=counts;
+}
+
 /* Group raw pdf.js text items into reading blocks. */
-function groupTextItems(rawItems, rotation, pageW, pageH){
-  const items = rawItems.filter(t=>t.str && t.str.trim().length>0).map(t=>({
+function groupTextItems(rawItems, rotation, pageW, pageH, meta){
+  const items = rawItems.map((t,i)=>({t, i})).filter(({t})=>t.str && t.str.trim().length>0).map(({t,i})=>({
     str:t.str, x:t.transform[4], y:t.transform[5],
-    w:t.width, h:t.height || Math.abs(t.transform[3]) || 10,
-    size: Math.abs(t.transform[0]) || Math.abs(t.transform[3]) || 10,
+    w:t.width, h:t.height || Math.hypot(t.transform[2], t.transform[3]) || 10,
+    // Font size is the length of the text-space x-axis vector. On rotated
+    // pages the size lives in transform[1]/transform[2], not [0]/[3],
+    // so the old |transform[0]| || |transform[3]| read 10 for every
+    // rotated run. hypot() is right for every rotation.
+    size: Math.hypot(t.transform[0], t.transform[1]) || Math.hypot(t.transform[2], t.transform[3]) || 10,
+    _color: meta && meta[i] ? meta[i] : null,
   }));
   if (!items.length) return [];
   // On rotated pages, text that is far apart visually can share a stored
@@ -599,12 +1058,31 @@ function groupTextItems(rawItems, rotation, pageW, pageH){
     const xs = parts.map(p=>p.x), xe = parts.map(p=>p.x+p.w);
     const ys = parts.map(p=>p.y-p.h), ye = parts.map(p=>p.y);
     const sizes = parts.map(p=>p.size);
+    // One fill color for the block, or none: mixed colors and unknown colors
+    // are reported as "could not determine" by the contrast checker.
+    const colorParts = parts.map(p=>p._color).filter(Boolean);
+    let fillColor=null, fillMixed=false, fillUnknown=false, colorIsStroke=false;
+    if (!colorParts.length) fillUnknown=true;
+    else if (colorParts.some(c=>c.unknown)) fillUnknown=true;
+    else {
+      const known=colorParts.map(c=>c.color).filter(Boolean);
+      if (!known.length) fillUnknown=true;
+      else {
+        const first=known[0];
+        if (known.some(c=>c.r!==first.r||c.g!==first.g||c.b!==first.b)) fillMixed=true;
+        else { fillColor=first; colorIsStroke=colorParts.every(c=>c.stroke); }
+      }
+    }
+    let boldLen=0, totalLen=0;
+    parts.forEach(p=>{ const n=(p.str||"").length; totalLen+=n; if (p._color && p._color.bold) boldLen+=n; });
     return {
       text: b.lines.map(l=>l.parts.map(p=>p.str).join("")).join("\n"),
       x: Math.min(...xs), y: Math.min(...ys),
       w: Math.max(...xe)-Math.min(...xs), h: Math.max(...ye)-Math.min(...ys),
       size: median(sizes),
       singleLine: b.lines.length===1,
+      fillColor, fillMixed, fillUnknown, colorIsStroke,
+      bold: totalLen>0 && boldLen/totalLen>=0.5,
     };
   });
 }
@@ -614,7 +1092,12 @@ async function extractPage(pdfDoc, pageNum){
   const page = await pdfDoc.getPage(pageNum);
   const tc = await page.getTextContent();
   const pageW = page.view[2]-page.view[0], pageH = page.view[3]-page.view[1];
-  const blocks = groupTextItems(tc.items, page.rotate || 0, pageW, pageH);
+  // Operator list, fetched once: the image scan and the text-color
+  // extraction (contrast) both walk it.
+  let ops = null;
+  try{ ops = await page.getOperatorList(); }catch(e){}
+  const colorMeta = ops ? extractTextColors(ops, tc.items) : null;
+  const blocks = groupTextItems(tc.items, page.rotate || 0, pageW, pageH, colorMeta);
   const sizes = blocks.map(b=>b.size);
   const medSize = median(sizes) || 10;
 
@@ -629,12 +1112,15 @@ async function extractPage(pdfDoc, pageNum){
       role = (pageNum===1 && i===0) ? "H1" : "H2";
     }
     if (/^([•\-*▪–—]\s+|\d+[.)]\s+)/.test(b.text.trim())) role = "LI";
-    items.push(mk("text",{text:b.text, role, x:b.x, y:b.y, w:b.w, h:b.h}));
+    items.push(mk("text",{text:b.text, role, x:b.x, y:b.y, w:b.w, h:b.h,
+      fontSize:b.size, bold:!!b.bold,
+      fillColor:b.fillColor||null, fillMixed:!!b.fillMixed, fillUnknown:!!b.fillUnknown,
+      colorIsStroke:!!b.colorIsStroke}));
   });
 
-  // images from operator list
+  // images from operator list (fetched above; also used for text colors)
   try{
-    const ops = await page.getOperatorList();
+    if (!ops) throw new Error("no operator list");
     const OPS = pdfjsLib.OPS;
     let cur = null, imgN = 0;
     for (let i=0;i<ops.fnArray.length;i++){
@@ -2060,6 +2546,214 @@ function a11yWizard(){
   render();
 }
 
+/* Contrast wizard (WCAG 1.4.3): one guided pass over text runs that fail
+   the contrast minimum, one step at a time, following the Accessibility
+   wizard pattern — summary step, one failing run per step, verification
+   step, Back/Skip/Stop, one undo step for the whole run, announced
+   summary. Each step shows the text, page, current and required ratios,
+   colors as names and hex, and a suggested fix color. Text on image or
+   gradient backgrounds is reported as a range and a pass is never
+   claimed for it. The wizard's own re-check is a sanity check, not
+   verification — PAC is the final verification. */
+async function contrastWizard(){
+  if (!S.pages.length){ announce("Load a PDF first."); return; }
+  announce("Checking text contrast. This may take a moment on large documents.");
+  const scan=await scanContrast();
+  if (!scan) return;
+  const steps=scan.results.filter(r=>r.status==="fail"||r.status==="range");
+  const und=scan.results.filter(r=>r.status==="undetermined");
+  const n=(c,word)=>`${c} ${word}${c===1?"":"s"}`;
+  const summaryText=`Contrast check: ${n(scan.counts.pass,"text run")} pass, ${n(scan.counts.fail,"text run")} fail, ${n(scan.counts.range,"text run")} on image or gradient backgrounds, ${n(scan.counts.undetermined,"text run")} could not be determined.`;
+  if (!steps.length){
+    openDialog({title:"Contrast check", submitLabel:"Close",
+      bodyHTML:`<p>${escapeHtml(summaryText)}</p>`+
+        (und.length?`<p>Runs that could not be determined:</p><ul>${und.map(u=>`<li>${escapeHtml(u.text.slice(0,80))} — page ${u.page}: ${escapeHtml(u.reason)}</li>`).join("")}</ul>`:"")+
+        `<p class="meta">The wizard's own check is a sanity check, not verification. Verify the exported file in PAC before delivery.</p>`});
+    return;
+  }
+  pushUndo();
+  let idx=0, fixed=0, skipped=0;
+  const root=$("dialog-root");
+  lastFocus=document.activeElement;
+  const allSteps=[{kind:"summary"}, ...steps.map(r=>({kind:"fail", r, done:false})), {kind:"verify"}];
+  const total=allSteps.length;
+  const finish=stopped=>{
+    root.innerHTML="";
+    document.removeEventListener("keydown", onKey, true);
+    if (lastFocus) lastFocus.focus();
+    S.selected.clear();
+    refreshContrastScanAfterFix();
+    renderObjectList(); renderIssuesPanelSafe();
+    const msg=(stopped?"Contrast wizard stopped. ":"Contrast wizard finished. ")+
+      `${fixed} text run${fixed===1?"":"s"} fixed${skipped?`, ${skipped} skipped`:""}. Press Ctrl+Z to undo. Verify the exported file in PAC before delivery.`;
+    logEvent("Contrast wizard", `${fixed} fixed, ${skipped} skipped${stopped?" (stopped early)":""}`);
+    announce(msg);
+  };
+  const failBody=r=>{
+    const it=itemById(r.itemId);
+    const shown=it?shownText(it):r.text;
+    const sizeText=`${r.size} point${r.bold?", bold":""}`;
+    let intro, ratioText, bgText;
+    if (r.bg && r.bg.type==="solid"){
+      intro="This text is too light against its background. People with low vision cannot read it.";
+      ratioText=`Current contrast ${r.ratio.toFixed(2)} to 1. Required: ${r.required} to 1 for ${r.large?"large":"normal"} text (${sizeText}).`;
+      bgText=`Background: solid ${formatColor(r.bg.color)}.`;
+    } else {
+      intro="This text sits on an image or gradient background, so there is no single background color and no single ratio.";
+      ratioText=`Contrast ranges from ${r.ratioLo.toFixed(2)} to 1 to ${r.ratioHi.toFixed(2)} to 1 across this text. Required: ${r.required} to 1 for ${r.large?"large":"normal"} text (${sizeText}). A pass can never be claimed for text on an image background.`;
+      bgText=`Background: ${r.bg?r.bg.type:"unknown"} (darkest sampled point ${formatColor(r.bg?r.bg.minColor:null)}, lightest ${formatColor(r.bg?r.bg.maxColor:null)}).`;
+    }
+    const sug=r.suggested
+      ? `<p>Suggested fix: <strong>${r.suggested.hex}</strong> (${colorName(r.suggested.rgb)}) at ${r.suggested.ratio.toFixed(2)} to 1${r.bg && r.bg.type!=="solid"?" against the hardest background point sampled":""}. Applying it changes only this text run.</p>`
+      : `<p>No single text color passes against this background. A solid background behind the text would also fix it, but this version cannot add one — ask a sighted teammate, or skip this run.</p>`;
+    return `<p><strong>\u201c${escapeHtml(shown.slice(0,80))}\u201d</strong> — page ${r.page}</p><p>${intro}</p><p>${ratioText}</p><p>Text color: ${formatColor(r.fg)}.</p><p>${bgText}</p>${sug}`+
+      fieldRow("wzhex","Or type a different color (hex, for example #7A4A00)","text","",false,"The ratio for your color is shown below before you apply it.")+
+      `<p id="wz-ratio-readout" role="status">Type a hex color to see its ratio.</p>`+
+      `<button type="button" data-wz="decor">Mark decorative instead</button>`;
+  };
+  const verifyBody=()=>{
+    const lines=steps.map(r=>{
+      const it=itemById(r.itemId);
+      const label=`\u201c${r.text.slice(0,60)}\u201d (page ${r.page})`;
+      if (!it) return `<li>${escapeHtml(label)}: text no longer exists.</li>`;
+      if (it.artifact) return `<li>${escapeHtml(label)}: marked decorative — contrast no longer applies.</li>`;
+      if (it.contrastFix){
+        const fg=hexToRgb(it.contrastFix.hex);
+        if (r.bg && r.bg.type==="solid"){
+          const ratio=contrastRatio(fg, r.bg.color);
+          return `<li>${escapeHtml(label)}: now ${rgbToHex(fg)} at ${ratio.toFixed(2)} to 1 — ${ratio>=r.required?"PASS":"still FAILS"} (required ${r.required} to 1).</li>`;
+        }
+        if (r.bg){
+          const lo=Math.min(contrastRatio(fg,r.bg.minColor), contrastRatio(fg,r.bg.maxColor));
+          const hi=Math.max(contrastRatio(fg,r.bg.minColor), contrastRatio(fg,r.bg.maxColor));
+          return `<li>${escapeHtml(label)}: now ${rgbToHex(fg)}; contrast ranges from ${lo.toFixed(2)} to 1 to ${hi.toFixed(2)} to 1. ${lo>=r.required?"Passes against the hardest background point sampled, but a pass can never be claimed for text on an image background — ask a sighted teammate to confirm.":"Still fails against the hardest background point sampled."}</li>`;
+        }
+      }
+      return `<li>${escapeHtml(label)}: unchanged.</li>`;
+    }).join("");
+    return `<p><strong>Verification summary</strong></p><p>Re-checked every changed run against the background sampled earlier. This is a sanity check, not verification — verify the exported file in PAC before delivery.</p><ul>${lines}</ul>`+
+      (und.length?`<p>Runs that could not be determined:</p><ul>${und.map(u=>`<li>${escapeHtml(u.text.slice(0,60))} — page ${u.page}: ${escapeHtml(u.reason)}</li>`).join("")}</ul>`:"");
+  };
+  const render=()=>{
+    const st=allSteps[idx];
+    root.innerHTML="";
+    const back=document.createElement("div"); back.className="dialog-backdrop";
+    const dlg=document.createElement("div");
+    dlg.className="dialog"; dlg.setAttribute("role","dialog");
+    dlg.setAttribute("aria-modal","true");
+    let label, heading, body, applyLabel="Apply fix & next", showSkip=true;
+    if (st.kind==="summary"){
+      label=`Contrast wizard, step ${idx+1} of ${total}: summary`;
+      heading=`Contrast wizard (${idx+1} of ${total})`;
+      body=`<p><strong>Contrast check summary</strong></p><p>${escapeHtml(summaryText)}</p>`+
+        `<p>${steps.length} text run${steps.length===1?"":"s"} need${steps.length===1?"s":""} a decision. You will review each one — there is no bulk apply.</p>`+
+        (und.length?`<p class="meta">${und.length} run${und.length===1?"":"s"} could not be determined and ${und.length===1?"is":"are"} not listed as steps.</p>`:"");
+      applyLabel="Begin review"; showSkip=false;
+    } else if (st.kind==="verify"){
+      label=`Contrast wizard, step ${idx+1} of ${total}: verification summary`;
+      heading=`Contrast wizard (${idx+1} of ${total})`;
+      body=verifyBody();
+      applyLabel="Finish"; showSkip=false;
+    } else {
+      const r=st.r;
+      label=`Contrast wizard, step ${idx+1} of ${total}: ${r.status==="range"?"text on image or gradient background":"low text contrast"}, page ${r.page}`;
+      heading=`Contrast wizard (${idx+1} of ${total})`;
+      body=`<p><strong>${r.status==="range"?"Text on image or gradient background":"Low text contrast"}</strong></p>`+failBody(r);
+    }
+    dlg.setAttribute("aria-label", label);
+    dlg.innerHTML=`<h2>${heading}</h2><div class="dbody">${body}</div><div class="actions">`+
+      `<button type="button" data-w="back"${idx===0?" disabled":""}>Back</button>`+
+      (showSkip?`<button type="button" data-w="skip">Skip</button>`:"")+
+      `<button type="button" data-w="stop">Stop wizard</button>`+
+      `<button type="button" data-w="apply" class="primary">${applyLabel}</button></div>`;
+    back.appendChild(dlg); root.appendChild(back);
+    if (st.kind==="fail"){
+      const r=st.r;
+      const hexInput=dlg.querySelector('[data-f="wzhex"]');
+      const readout=dlg.querySelector("#wz-ratio-readout");
+      if (hexInput && readout){
+        hexInput.addEventListener("input", ()=>{
+          const v=hexInput.value.trim();
+          if (!v){ readout.textContent="Type a hex color to see its ratio."; return; }
+          const c=hexToRgb(v);
+          if (!c){ readout.textContent=`"${v}" is not a valid hex color. Use 3 or 6 hex digits, for example #7A4A00.`; return; }
+          let ratio, against;
+          if (r.bg && r.bg.type==="solid"){ ratio=contrastRatio(c, r.bg.color); against="this background"; }
+          else if (r.bg){ ratio=Math.min(contrastRatio(c,r.bg.minColor), contrastRatio(c,r.bg.maxColor)); against="the hardest background point sampled"; }
+          else { readout.textContent="The background is unknown, so no ratio can be shown."; return; }
+          readout.textContent=`${rgbToHex(c)} against ${against}: ${ratio.toFixed(2)} to 1 — ${ratio>=r.required?"passes":"does not pass"} the required ${r.required} to 1.`;
+        });
+      }
+      const decor=dlg.querySelector('[data-wz="decor"]');
+      if (decor) decor.addEventListener("click", ()=>{
+        const it=itemById(r.itemId);
+        if (it){ it.artifact=true; it.contrastFix=null; }
+        if (!st.done){ fixed++; st.done=true; }
+        logEvent("Contrast wizard", `“${r.text.slice(0,40)}” page ${r.page} marked decorative`);
+        announce("Marked decorative. Contrast no longer applies to this text.");
+        idx++; render();
+      });
+    }
+    dlg.querySelector('[data-w="apply"]').addEventListener("click", ()=>{
+      if (st.kind==="summary"){ idx++; render(); return; }
+      if (st.kind==="verify"){ finish(false); return; }
+      const r=st.r;
+      const it=itemById(r.itemId);
+      if (!it){ announce("That text no longer exists."); idx++; render(); return; }
+      const customRaw=dlg.querySelector('[data-f="wzhex"]') ? dlg.querySelector('[data-f="wzhex"]').value.trim() : "";
+      let hex=null;
+      if (customRaw){
+        const c=hexToRgb(customRaw);
+        if (!c){ announce(`"${customRaw}" is not a valid hex color. Type 3 or 6 hex digits, or clear it to use the suggested color.`); return; }
+        hex=rgbToHex(c);
+      } else if (r.suggested){ hex=r.suggested.hex; }
+      else { announce("No passing color is available for this run — mark it decorative or press Skip."); return; }
+      // A custom color must pass before it can be applied.
+      const chosen=hexToRgb(hex);
+      let chosenRatio;
+      if (r.bg && r.bg.type==="solid") chosenRatio=contrastRatio(chosen, r.bg.color);
+      else if (r.bg) chosenRatio=Math.min(contrastRatio(chosen,r.bg.minColor), contrastRatio(chosen,r.bg.maxColor));
+      if (chosenRatio!==undefined && chosenRatio<r.required){
+        announce(`${hex} is ${chosenRatio.toFixed(2)} to 1 — below the required ${r.required} to 1. Pick a color that passes, or press Skip.`);
+        return;
+      }
+      const old=it.contrastFix?it.contrastFix.old:colorToRestore(it.fillColor);
+      if (!old){ announce("The original color could not be determined, so the fix cannot be applied safely. Press Skip."); return; }
+      it.contrastFix={hex, old, stroke:!!r.stroke};
+      if (!st.done){ fixed++; st.done=true; }
+      logEvent("Contrast fix", `“${r.text.slice(0,40)}” page ${r.page} → ${hex}`);
+      announce(`Contrast fixed: text on page ${r.page} changed to ${hex}.`);
+      idx++; render();
+    });
+    const skipBtn=dlg.querySelector('[data-w="skip"]');
+    if (skipBtn) skipBtn.addEventListener("click", ()=>{ if (st.kind==="fail"){ skipped++; } idx++; render(); });
+    dlg.querySelector('[data-w="back"]').addEventListener("click", ()=>{ if(idx>0){ idx--; render(); } });
+    dlg.querySelector('[data-w="stop"]').addEventListener("click", ()=>finish(true));
+    const f=[...dlg.querySelectorAll("button,input,select,textarea")].filter(e=>!e.disabled);
+    if(f.length) f[0].focus();
+  };
+  function onKey(e){
+    if(e.key==="Escape"){ e.stopPropagation(); finish(true); }
+    else if(e.key==="Enter" && !e.shiftKey){
+      const t2=e.target, tag=t2.tagName?t2.tagName.toLowerCase():"";
+      if(tag!=="textarea" && tag!=="button"){
+        e.preventDefault(); e.stopPropagation();
+        const sv=root.querySelector('[data-w="apply"]');
+        if(sv) sv.click();
+      }
+    }
+    else if(e.key==="Tab"){
+      const f=[...root.querySelectorAll(".dialog button,.dialog input,.dialog select,.dialog textarea")].filter(x=>!x.disabled);
+      if(!f.length) return;
+      const first=f[0], last=f[f.length-1];
+      if(e.shiftKey && document.activeElement===first){ e.preventDefault(); last.focus(); }
+      else if(!e.shiftKey && document.activeElement===last){ e.preventDefault(); first.focus(); }
+    }
+  }
+  document.addEventListener("keydown", onKey, true);
+  render();
+}
+
 /* Propagate a label down a column: label one field (e.g. "Heritage trait 1"),
    then apply the pattern to the similar unlabeled fields below it
    ("Heritage trait 2".."5"). A trailing number increments; otherwise numbers
@@ -2260,7 +2954,7 @@ function userGuideDialog(){
     `<p>The workbench has three tabs. Move between them with Tab and arrow keys; each tab is labeled.</p>`+
     `<ul>`+
     `<li><strong>Read original:</strong> the source text of the current page in linear reading order, plus <strong>Run OCR on this page</strong> for scanned pages.</li>`+
-    `<li><strong>Remediate:</strong> the <strong>Actions menu</strong> button (also Shift+F10 or the Applications key), <strong>Undo/Redo</strong>, <strong>Set document title</strong>, <strong>Run OCR on this document</strong>, the <strong>Accessibility wizard</strong>, bulk tools (Propagate label, Sort reading order, Label all fields, Auto-label fields, Detect button grids, Mark fragments decorative, Fix fragmented headings), <strong>Remediation progress</strong>, <strong>Accessibility settings</strong>, and this <strong>User guide</strong>.</li>`+
+    `<li><strong>Remediate:</strong> the <strong>Actions menu</strong> button (also Shift+F10 or the Applications key), <strong>Undo/Redo</strong>, <strong>Set document title</strong>, <strong>Run OCR on this document</strong>, the <strong>Accessibility wizard</strong>, the <strong>Contrast wizard</strong>, bulk tools (Propagate label, Sort reading order, Label all fields, Auto-label fields, Detect button grids, Mark fragments decorative, Fix fragmented headings), <strong>Remediation progress</strong>, <strong>Accessibility settings</strong>, and this <strong>User guide</strong>.</li>`+
     `<li><strong>Document Objects</strong> (a listbox): every text block, image, field, and table on the page. Arrow keys move through objects; Shift+F10 or the Applications key opens the Actions menu for the selected object; "/" jumps to the command search inside the menu. After any remediation action, the objects are automatically deselected, so your next action can't accidentally include them — select afresh each time.</li>`+
     `<li><strong>Accessibility issues</strong> (automatically detected): a plain list of problems found in the current state of the document. Press Enter on an issue to open its suggested fix.</li>`+
     `<li><strong>Preview / Fill Form:</strong> the remediated reading view, an inline form filler, and <strong>Check &amp; export</strong> (final check, filled PDF, tagged PDF, accessible HTML, remediation report, Save, Save As, Load session).</li>`+
@@ -2278,7 +2972,7 @@ function userGuideDialog(){
     `<li><strong>Preview / Fill Form:</strong> read the remediated result with your screen reader, then export.</li>`+
     `</ol>`+
     h("ug-wizard","Accessibility wizard")+
-    `<p>The wizard (Remediation toolbar, <strong>Accessibility wizard</strong>) takes you through every automatically detected issue in one guided pass, in fix-friendly order: title, fragmented headings, decorative fragments, button-row groups, unlabeled fields, then images. Each step shows the issue and a suggested fix you can accept as-is, edit, or skip; Back revisits the previous step and Stop ends the run. One undo step covers the whole run, and a summary is announced at the end. Rows are grouped before fields are labeled so group labels can inform the field labels.</p>`+
+    `<p>The wizard (Remediation toolbar, <strong>Accessibility wizard</strong>) takes you through every automatically detected issue in one guided pass, in fix-friendly order: title, fragmented headings, decorative fragments, button-row groups, unlabeled fields, then images. Each step shows the issue and a suggested fix you can accept as-is, edit, or skip; Back revisits the previous step and Stop ends the run. One undo step covers the whole run, and a summary is announced at the end. Rows are grouped before fields are labeled so group labels can inform the field labels. The <strong>Contrast wizard</strong> (same toolbar) checks text contrast against WCAG 1.4.3 and walks each failing run one at a time, showing the ratio, the colors as names and hex, and a suggested fix color you can accept, edit, or skip. Text on image or gradient backgrounds is reported as a range, never as a pass.</p>`+
     h("ug-shortcuts","Keyboard shortcuts")+
     `<h4>Global</h4><ul>`+
     `<li><kbd>Ctrl+Z</kbd> (Mac: <kbd>Cmd+Z</kbd>) — Undo</li>`+
@@ -3377,6 +4071,7 @@ $("mact-title").addEventListener("click", setDocTitleDialog);
 $("act-ocr").addEventListener("click", runOCR);
 $("mact-ocr-doc").addEventListener("click", runOCRDocument);
 $("mact-a11y-wizard").addEventListener("click", a11yWizard);
+$("mact-contrast-wizard").addEventListener("click", ()=>{ contrastWizard(); });
 $("mact-propagate").addEventListener("click", propagateLabelDialog);
 $("mact-colsort").addEventListener("click", columnSortDialog);
 $("mact-progress").addEventListener("click", progressDashboard);
@@ -4292,6 +4987,23 @@ function runChecker(){
   if (!S.pages.some(p=>(p.tables||[]).length)){
     // table-like content hint: skip (too noisy)
   }
+  // contrast (WCAG 1.4.3): from the last Contrast wizard scan, if one ran.
+  // The wizard's own check is early warning, not verification — PAC still
+  // verifies the exported file. A stale scan is cleared on undo/redo/load.
+  if (S.contrastScan){
+    S.contrastScan.results.forEach(r=>{
+      const it=r.itemId?itemById(r.itemId):null;
+      if (!it || it.artifact) return;
+      if (r.status==="fail")
+        add("error",r.page,`Text contrast ${r.ratio.toFixed(2)} to 1 for “${r.text.slice(0,60)}” — needs ${r.required} to 1. Use the Contrast wizard to fix it.`,r.itemId);
+      else if (r.status==="range")
+        add("warning",r.page,`Text contrast over an image or gradient background ranges from ${r.ratioLo.toFixed(2)} to 1 to ${r.ratioHi.toFixed(2)} to 1 for “${r.text.slice(0,60)}” — needs ${r.required} to 1. A pass can never be claimed for text on an image background; use the Contrast wizard.`,r.itemId);
+    });
+    const undN=S.contrastScan.results.filter(r=>r.status==="undetermined").length;
+    if (undN) add("info",0,`${undN} text run${undN===1?"":"s"} could not be checked for contrast (color or background could not be determined).`);
+  } else {
+    add("info",0,"Contrast has not been checked yet — use the Contrast wizard (Remediation toolbar) to check text contrast (WCAG 1.4.3).");
+  }
   S.issues = issues;
   const e = issues.filter(i=>i.sev==="error").length, w = issues.filter(i=>i.sev==="warning").length;
   logEvent("Checker run", `${e} error(s), ${w} warning(s)`);
@@ -4321,6 +5033,22 @@ function detectIssues(){
       suggestion:"Add a concise title describing the document.",
       canAuto:false,
       manualFix:()=>setDocTitleDialog()});
+  // contrast (WCAG 1.4.3): from the last Contrast wizard scan, if one ran.
+  if (S.contrastScan){
+    S.contrastScan.results.forEach(r=>{
+      if (r.status!=="fail" && r.status!=="range") return;
+      const it=itemById(r.itemId);
+      if (!it || it.artifact) return;
+      add({sev:r.status==="fail"?"error":"warning", page:r.page, itemId:r.itemId,
+        title:r.status==="fail"?"Text contrast too low":"Text contrast over an image or gradient",
+        description:r.status==="fail"
+          ? `Text “${r.text.slice(0,60)}” on page ${r.page} is ${r.ratio.toFixed(2)} to 1, where ${r.required} to 1 is required.`
+          : `Text “${r.text.slice(0,60)}” on page ${r.page} sits on an image or gradient background; contrast ranges from ${r.ratioLo.toFixed(2)} to 1 to ${r.ratioHi.toFixed(2)} to 1, where ${r.required} to 1 is required.`,
+        suggestion:"Open the Contrast wizard to review this text and apply a fix.",
+        canAuto:false,
+        manualFix:()=>{ selectIssueItem({page:r.page,itemId:r.itemId}); contrastWizard(); }});
+    });
+  }
   S.pages.forEach(pg=>{
     pg.items.filter(i=>!i.hidden).forEach(it=>{
       if (it.kind==="image" && !it.artifact && !it.alt)
@@ -5146,6 +5874,16 @@ function buildAssignments(pg, splitOk){
   return A;
 }
 
+/* Wrap one text run in its structure tag, inserting a contrast-fix color
+   change around the run when the item has one: the new color before the
+   run, the original color after it, so later runs keep their own color.
+   Color operators are legal inside a text object; q/Q would not be. */
+function tagRunStr(tag, mcid, raw, fix){
+  const cw = colorOpsForFix(fix);
+  const inner = cw ? cw.newOp+"\n"+raw+"\n"+cw.oldOp : raw;
+  return "/"+tag+" <</MCID "+mcid+">> BDC\n"+inner+"\nEMC";
+}
+
 function wrapRuns(text, runs, assigns){
   // returns {out, matched:[{assign fields..., mcids:[]}]} in reading order
   // Text is matched by SEARCHING each assignment's normalised text in the
@@ -5215,7 +5953,7 @@ function wrapRuns(text, runs, assigns){
           } else {
             const tag=a.kind==="cell"?a.role:a.role;
             repl.push({start:r.start,end:r.end,
-              str:"/"+tag+" <</MCID "+mcid+">> BDC\n"+r.raw+"\nEMC"});
+              str:tagRunStr(tag, mcid, r.raw, a.item && a.item.contrastFix)});
             a.mcids.push(mcid); mcid++;
           }
           stats.matchedRuns++;
@@ -5236,7 +5974,7 @@ function wrapRuns(text, runs, assigns){
       } else {
         const tag=a.kind==="cell"?a.role:a.role;
         repl.push({start:r.start,end:r.end,
-          str:"/"+tag+" <</MCID "+mcid+">> BDC\n"+r.raw+"\nEMC"});
+          str:tagRunStr(tag, mcid, r.raw, a.item && a.item.contrastFix)});
         a.mcids.push(mcid); mcid++;
       }
       stats.matchedRuns++;
