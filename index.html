@@ -232,7 +232,7 @@ const S = {
   pdfDoc: null, pdfFile: null, fileName: "", pages: [],
   currentPage: 1, viewMode: "all", selected: new Set(), issues: [],
   signatures: {},
-  filled: {}, log: [], undoStack: [], redoStack: [], contrastScan: null, tabsKnown: false, langKnown: false, docLang: null,
+  filled: {}, log: [], undoStack: [], redoStack: [], contrastScan: null, tabsKnown: false, langKnown: false, docLang: null, displayDocTitleKnown: false, displayDocTitle: null,
   docTitle: "", readingOrder: {}, tables: {}, groups: {},
   dirty: false, saveName: null, saveFormat: null, saveHandle: null,
   accelerators: {},
@@ -533,6 +533,7 @@ async function loadFile(file){  if (file.type !== "application/pdf" && !/\.pdf$/
     await enrichFieldTooltips();
     await readTabOrder();
     await readLanguage();
+    await readDisplayDocTitle();
     $("workbench").hidden = false;
     setFileStatus(`Loaded ${file.name}: ${S.pdfDoc.numPages} page(s).${metaTitle ? "" : " Warning: the document has no title."}`, !metaTitle);
     logEvent("Opened file", file.name);
@@ -4965,6 +4966,19 @@ function languageFindings(){
   return out;
 }
 
+/* DisplayDocTitle findings shared by the finish checker and the issues
+   panel. Document-level, not per page (page 0). kind "missing": no
+   ViewerPreferences dictionary or no DisplayDocTitle entry in it.
+   kind "false": DisplayDocTitle is explicitly false, so viewers show the
+   file name instead of the document title (Matterhorn 07-001, 07-002).
+   Returns [] when the value could not be read on load, or when it is
+   true (pass). */
+function displayDocTitleFindings(){
+  if (!S.displayDocTitleKnown) return [];
+  if (S.displayDocTitle === true) return [];
+  return [{page:0, kind:S.displayDocTitle === false ? "false" : "missing"}];
+}
+
 function runChecker(){
   const issues = [];
   const add = (sev,page,message,itemId)=>issues.push({sev,page,message,itemId});
@@ -5075,6 +5089,22 @@ function runChecker(){
         add("info",0,"Document language is set on the page(s) (WCAG 3.1.1).");
     }
   }
+  // DisplayDocTitle (Matterhorn 07-001, 07-002): catalog ViewerPreferences
+  // read on load. Viewers show the document title in the title bar only
+  // when DisplayDocTitle is true; otherwise they show the file name.
+  if (!S.displayDocTitleKnown){
+    add("info",0,"DisplayDocTitle could not be checked — the file could not be read again.");
+  } else {
+    const ddtFindings = displayDocTitleFindings();
+    ddtFindings.forEach(f=>{
+      if (f.kind==="false")
+        add("warning",0,"DisplayDocTitle is set to false, so viewers show the file name instead of the document title. Export a tagged PDF to set it to true (Matterhorn 07-001, 07-002).");
+      else
+        add("warning",0,"Document title will not be shown in the viewer title bar — no ViewerPreferences DisplayDocTitle is set. Export a tagged PDF to set it (Matterhorn 07-001, 07-002).");
+    });
+    if (!ddtFindings.length)
+      add("info",0,"Document title will be displayed in the viewer title bar (DisplayDocTitle is set; Matterhorn 07-001, 07-002).");
+  }
   S.issues = issues;
   const e = issues.filter(i=>i.sev==="error").length, w = issues.filter(i=>i.sev==="warning").length;
   logEvent("Checker run", `${e} error(s), ${w} warning(s)`);
@@ -5150,6 +5180,26 @@ function detectIssues(){
       suggestion:"Export a tagged PDF — export writes the document language (default en-US) into the catalog automatically.",
       canAuto:false,
       manualFix:()=>{ selectIssueItem({page:f.page}); taggedPDFDialog(); }});
+  });
+  // DisplayDocTitle (Matterhorn 07-001, 07-002): warning only; the pass
+  // case is not an issue. The fix is the tagged-PDF export, which sets
+  // ViewerPreferences DisplayDocTitle to true automatically — the manual
+  // fix opens that export dialog.
+  displayDocTitleFindings().forEach(f=>{
+    if (f.kind==="false")
+      add({sev:"warning", page:0,
+        title:"DisplayDocTitle is set to false",
+        description:"The document catalog sets ViewerPreferences DisplayDocTitle to false, so viewers show the file name in the title bar instead of the document title.",
+        suggestion:"Export a tagged PDF — export sets DisplayDocTitle to true automatically.",
+        canAuto:false,
+        manualFix:()=>{ selectIssueItem({page:0}); taggedPDFDialog(); }});
+    else
+      add({sev:"warning", page:0,
+        title:"Document title not set to display",
+        description:"The document catalog has no ViewerPreferences DisplayDocTitle entry, so viewers show the file name in the title bar instead of the document title.",
+        suggestion:"Export a tagged PDF — export sets DisplayDocTitle to true automatically.",
+        canAuto:false,
+        manualFix:()=>{ selectIssueItem({page:0}); taggedPDFDialog(); }});
   });
   S.pages.forEach(pg=>{
     pg.items.filter(i=>!i.hidden).forEach(it=>{
@@ -6360,6 +6410,9 @@ function buildTaggedPDF(title, lang, outName, returnBlob){
       pdfDoc.catalog.set(PN("MarkInfo"),ctx.register(mi));
       pdfDoc.catalog.set(PN("Lang"),PDFLib.PDFString.of(lang));
       pdfDoc.setTitle(title);
+      // DisplayDocTitle (Matterhorn 07-001, 07-002): tell viewers to show
+      // the document title in the window title bar instead of the file name.
+      pdfDoc.catalog.getOrCreateViewerPreferences().setDisplayDocTitle(true);
       S.docTitle=title;
 
       // Embed applied electronic signatures as images with Figure tagging + metadata.
@@ -6500,6 +6553,25 @@ async function readLanguage(){
     });
     S.langKnown = true;
   }catch(e){ console.warn("language read failed:", e.message); }
+}
+/* ----- DisplayDocTitle (Matterhorn 07-001, 07-002) -----
+   Read the catalog ViewerPreferences /DisplayDocTitle on load with
+   pdf-lib, so the checker can report it without re-reading the file.
+   Export already sets DisplayDocTitle to true; this is the checker half.
+   S.displayDocTitle: true | false | null (key missing — no
+   ViewerPreferences dictionary, or no DisplayDocTitle entry in it).
+   S.displayDocTitleKnown is false when the file could not be re-read.
+   getDisplayDocTitle() alone cannot tell missing from false (both read
+   false), so the raw entry is used. */
+async function readDisplayDocTitle(){
+  S.displayDocTitleKnown = false; S.displayDocTitle = null;
+  try{
+    const pdfDoc = await PDFLib.PDFDocument.load(await pdfBytes());
+    const prefs = pdfDoc.catalog.getViewerPreferences();
+    const raw = prefs ? prefs.DisplayDocTitle() : undefined;
+    S.displayDocTitle = raw ? raw.asBoolean() : null;
+    S.displayDocTitleKnown = true;
+  }catch(e){ console.warn("DisplayDocTitle read failed:", e.message); }
 }
 
 </script>
