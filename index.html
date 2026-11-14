@@ -232,7 +232,7 @@ const S = {
   pdfDoc: null, pdfFile: null, fileName: "", pages: [],
   currentPage: 1, viewMode: "all", selected: new Set(), issues: [],
   signatures: {},
-  filled: {}, log: [], undoStack: [], redoStack: [], contrastScan: null, tabsKnown: false, langKnown: false, docLang: null, displayDocTitleKnown: false, displayDocTitle: null, xmpKnown: false, xmpState: null, linksKnown: false, linkAnnots: [],
+  filled: {}, log: [], undoStack: [], redoStack: [], contrastScan: null, tabsKnown: false, langKnown: false, docLang: null, displayDocTitleKnown: false, displayDocTitle: null, xmpKnown: false, xmpState: null, linksKnown: false, linkAnnots: [], tableScopeKnown: false, tableScope: [], tableScopeTables: 0,
   docTitle: "", readingOrder: {}, tables: {}, groups: {},
   dirty: false, saveName: null, saveFormat: null, saveHandle: null,
   accelerators: {},
@@ -536,6 +536,7 @@ async function loadFile(file){  if (file.type !== "application/pdf" && !/\.pdf$/
     await readDisplayDocTitle();
     await readXmpMetadata();
     await readLinks();
+    await readTableScope();
     $("workbench").hidden = false;
     setFileStatus(`Loaded ${file.name}: ${S.pdfDoc.numPages} page(s).${metaTitle ? "" : " Warning: the document has no title."}`, !metaTitle);
     logEvent("Opened file", file.name);
@@ -5145,6 +5146,21 @@ function runChecker(){
     if (!lkFindings.length)
       add("info",0,`Link annotations are nested in Link tags with alternate descriptions (${S.linkAnnots.length} link${S.linkAnnots.length===1?"":"s"}; Matterhorn 28-011, 28-012).`);
   }
+  // table header Scope (Matterhorn 15-003): TH cells in tables not
+  // using Headers/IDs need a Scope attribute (Row or Column), read
+  // from the structure tree on load. A table with no TH cells, or one
+  // using Headers/IDs, is not flagged; a document with no tables
+  // reports nothing at all.
+  if (!S.tableScopeKnown){
+    add("info",0,"Table header Scope could not be checked — the file could not be read again.");
+  } else {
+    const tsFindings = tableScopeFindings();
+    tsFindings.forEach(f=>{
+      add("warning",f.page,`Table${f.page?` on page ${f.page}`:""} has ${f.missing} of ${f.total} header cell${f.total===1?"":"s"} without a Scope attribute. Make the table in FRAME with header rows/columns designated, then export a tagged PDF to write Scope on header cells (Matterhorn 15-003).`);
+    });
+    if (!tsFindings.length && S.tableScopeTables>0)
+      add("info",0,"Table header cells carry a Scope attribute (Row or Column) (Matterhorn 15-003).");
+  }
   S.issues = issues;
   const e = issues.filter(i=>i.sev==="error").length, w = issues.filter(i=>i.sev==="warning").length;
   logEvent("Checker run", `${e} error(s), ${w} warning(s)`);
@@ -5288,6 +5304,19 @@ function detectIssues(){
         suggestion:"Add link text describing the link's destination.",
         canAuto:false,
         manualFix:()=>{ selectIssueItem({page:f.page}); setLinkTextDialog(f.rec); }});
+  });
+  // table header Scope (Matterhorn 15-003): warnings only; the pass
+  // case is not an issue. The fix is to model the table in FRAME with
+  // its headers designated and export a tagged PDF, which writes Scope
+  // (Row or Column) on header cells automatically — the manual fix
+  // opens that export dialog.
+  tableScopeFindings().forEach(f=>{
+    add({sev:"warning", page:f.page,
+      title:"Table header cells missing Scope",
+      description:`Table${f.page?` on page ${f.page}`:""} has ${f.missing} of ${f.total} header cell${f.total===1?"":"s"} without a Scope attribute, so assistive technology cannot tell whether each header labels a row or a column (Matterhorn 15-003).`,
+      suggestion:"Make the table in FRAME with header rows/columns designated (select its cells and use Make table, or Edit table), then export a tagged PDF — export writes Scope (Row or Column) on header cells automatically.",
+      canAuto:false,
+      manualFix:()=>{ selectIssueItem({page:f.page}); taggedPDFDialog(); }});
   });
   S.pages.forEach(pg=>{
     pg.items.filter(i=>!i.hidden).forEach(it=>{
@@ -6082,7 +6111,7 @@ function buildAssignments(pg, splitOk){
         if (isCovered(t,id)) return;
         const cell=itemById(id); if(!cell) return;
         A.push({kind:"cell",item:cell,role:isCellHeader(t,id,r,c)?"TH":"TD",
-          tableId:t.id,row:r,norm:normStr(cell.text),
+          tableId:t.id,row:r,col:c,norm:normStr(cell.text),
           actualText:cell.editedText||""});
       }));
       continue;
@@ -6389,9 +6418,21 @@ function buildTaggedPDF(title, lang, outName, returnBlob){
             const byRow={};
             cells.forEach(c=>{(byRow[c.row]=byRow[c.row]||[]).push(c);});
             const trRefs=Object.keys(byRow).sort((a,b)=>a-b).map(rk=>{
-              const cellRefs=byRow[rk].map(c=>
-                makeElem(c.role,docRef,c.mcids.map(PDFLib.PDFNumber.of),pageRef,
-                  c.actualText?{ActualText:makeAltObj(c.actualText)}:null));
+              const cellRefs=byRow[rk].map(c=>{
+                let extra = c.actualText?{ActualText:makeAltObj(c.actualText)}:null;
+                if (c.role==="TH"){
+                  // Scope (Matterhorn 15-003): a header-column cell
+                  // labels its row, every other header cell labels its
+                  // column — the same rule the HTML export uses.
+                  const tt = getTable(pg, c.tableId);
+                  const scopeName = (tt && c.col < (tt.headerCols||0)) ? "Row" : "Column";
+                  const attr = ctx.obj({});
+                  attr.set(PN("O"), PN("Table"));
+                  attr.set(PN("Scope"), PN(scopeName));
+                  extra = Object.assign(extra||{}, {A: attr});
+                }
+                return makeElem(c.role,docRef,c.mcids.map(PDFLib.PDFNumber.of),pageRef,extra);
+              });
               const tr=newDict();
               makeElem2(tr,"TR",docRef,cellRefs,pageRef);
               return tr;
@@ -6948,6 +6989,113 @@ async function readLinks(){
     });
     S.linksKnown = true;
   }catch(e){ console.warn("link annotations read failed:", e.message); }
+}
+/* ----- table header Scope (Matterhorn 15-003) -----
+   Read the structure tree on load and record, per table, how many TH
+   cells lack a Scope attribute. A TH needs Scope (Row or Column) in a
+   table that does not use Headers and IDs; a table using Headers/IDs
+   (a cell carrying a /Headers attribute) is exempt, as is a table with
+   no TH cells at all. A document with no tables records nothing.
+   S.tableScopeKnown is false when the file could not be re-read. */
+async function readTableScope(){
+  S.tableScopeKnown = false; S.tableScope = []; S.tableScopeTables = 0;
+  try{
+    const pdfDoc = await PDFLib.PDFDocument.load(await pdfBytes());
+    const ctx = pdfDoc.context;
+    const PN = n=>PDFLib.PDFName.of(n);
+    const pages = pdfDoc.getPages();
+    // Page number of a structure element, from its /Pg entry (the page
+    // dictionary it resolves to); 0 when the element names no page.
+    const pageOf = d=>{
+      let p = null;
+      try{ p = d.lookup(PN("Pg")); }catch(e){}
+      if (!p) return 0;
+      let pd = null;
+      try{ pd = ctx.lookup(p); }catch(e){}
+      if (!pd) return 0;
+      for (let i=0;i<pages.length;i++) if (pages[i].node===pd) return i+1;
+      return 0;
+    };
+    // /O /Table attribute dictionaries on a structure element: /A may
+    // be one dictionary or an array of them (attribute classes, which
+    // are names rather than dictionaries, are skipped).
+    const tableAttrs = d=>{
+      const out = [];
+      let a = null;
+      try{ a = d.lookup(PN("A")); }catch(e){}
+      if (!a) return out;
+      const vals = (a instanceof PDFLib.PDFArray)
+        ? Array.from({length:a.size()},(_,i)=>a.get(i)) : [a];
+      for (const av of vals){
+        let ad = null;
+        try{ ad = ctx.lookup(av); }catch(e){ continue; }
+        if (!ad || !ad.lookup) continue;
+        let o = "";
+        try{ const ov = ad.lookup(PN("O")); if (ov) o = String(ov); }catch(e){}
+        if (o==="/Table") out.push(ad);
+      }
+      return out;
+    };
+    const tables = [];
+    const walk = (k, cur)=>{
+      if (!k) return;
+      if (k instanceof PDFLib.PDFNumber) return; // MCID
+      if (k instanceof PDFLib.PDFArray){
+        for (let i=0;i<k.size();i++) walk(k.get(i), cur);
+        return;
+      }
+      let d = k;
+      try{ d = ctx.lookup(k); }catch(e){ return; }
+      if (!d || !d.lookup) return;
+      let type = "";
+      try{ const t = d.lookup(PN("Type")); if (t) type = String(t); }catch(e){}
+      if (type==="/OBJR") return;
+      let sName = "";
+      try{ const s = d.lookup(PN("S")); if (s) sName = String(s); }catch(e){}
+      if (sName==="/Table" && !cur){
+        cur = {page:pageOf(d), th:0, missing:0, headersIds:false};
+        tables.push(cur);
+      }
+      if (cur && (sName==="/TH" || sName==="/TD")){
+        const attrs = tableAttrs(d);
+        if (attrs.some(ad=>{ try{ return !!ad.lookup(PN("Headers")); }catch(e){ return false; } }))
+          cur.headersIds = true;
+        if (sName==="/TH"){
+          cur.th++;
+          if (!cur.page) cur.page = pageOf(d);
+          const hasScope = attrs.some(ad=>{
+            let sc = null;
+            try{ sc = ad.lookup(PN("Scope")); }catch(e){}
+            return sc && (String(sc)==="/Row" || String(sc)==="/Column" || String(sc)==="/Both");
+          });
+          if (!hasScope) cur.missing++;
+        }
+      }
+      let kk = null;
+      try{ kk = d.lookup(PN("K")); }catch(e){}
+      if (kk) walk(kk, cur);
+    };
+    try{
+      const root = pdfDoc.catalog.lookup(PN("StructTreeRoot"));
+      if (root) walk(root, null);
+    }catch(e){ console.warn("table scope structure walk failed:", e.message); }
+    tables.forEach(t=>{
+      if (t.th>0 && !t.headersIds){
+        S.tableScopeTables++;
+        if (t.missing>0)
+          S.tableScope.push({page:t.page||0, kind:"missingScope", missing:t.missing, total:t.th});
+      }
+    });
+    S.tableScopeKnown = true;
+  }catch(e){ console.warn("table scope read failed:", e.message); }
+}
+/* Scope findings shared by the finish checker and the issues panel.
+   One entry per table with TH cells missing Scope, in a table not
+   using Headers/IDs. Returns [] when the values could not be read on
+   load, or when no table needs Scope. */
+function tableScopeFindings(){
+  if (!S.tableScopeKnown) return [];
+  return S.tableScope || [];
 }
 /* Human-readable description of a GoTo destination value: a named
    destination string, or "in-document destination" for an explicit
