@@ -232,7 +232,7 @@ const S = {
   pdfDoc: null, pdfFile: null, fileName: "", pages: [],
   currentPage: 1, viewMode: "all", selected: new Set(), issues: [],
   signatures: {},
-  filled: {}, log: [], undoStack: [], redoStack: [], contrastScan: null, tabsKnown: false,
+  filled: {}, log: [], undoStack: [], redoStack: [], contrastScan: null, tabsKnown: false, langKnown: false, docLang: null,
   docTitle: "", readingOrder: {}, tables: {}, groups: {},
   dirty: false, saveName: null, saveFormat: null, saveHandle: null,
   accelerators: {},
@@ -532,6 +532,7 @@ async function loadFile(file){  if (file.type !== "application/pdf" && !/\.pdf$/
     S.currentPage = 1;
     await enrichFieldTooltips();
     await readTabOrder();
+    await readLanguage();
     $("workbench").hidden = false;
     setFileStatus(`Loaded ${file.name}: ${S.pdfDoc.numPages} page(s).${metaTitle ? "" : " Warning: the document has no title."}`, !metaTitle);
     logEvent("Opened file", file.name);
@@ -4948,6 +4949,22 @@ function tabOrderFindings(){
   return out;
 }
 
+/* Language findings shared by the finish checker and the issues panel.
+   kind "missing": the page has no /Lang of its own and the catalog has
+   no /Lang, so no effective language can be determined for it
+   (Matterhorn 11-001). A page inherits the catalog language, so a
+   catalog /Lang alone is a pass for every page. Returns [] when the
+   values could not be read on load. */
+function languageFindings(){
+  if (!S.langKnown) return [];
+  if (S.docLang) return [];
+  const out = [];
+  S.pages.forEach(pg=>{
+    if (!pg.lang) out.push({page:pg.pageNum, kind:"missing"});
+  });
+  return out;
+}
+
 function runChecker(){
   const issues = [];
   const add = (sev,page,message,itemId)=>issues.push({sev,page,message,itemId});
@@ -5042,6 +5059,22 @@ function runChecker(){
         add("info",0,"Tab order does not apply — no page has form fields or annotations.");
     }
   }
+  // document language (WCAG 3.1.1, Matterhorn 11-001): catalog /Lang and
+  // per-page /Lang read on load. A page inherits the catalog language.
+  if (!S.langKnown){
+    add("info",0,"Document language could not be checked — the file could not be read again.");
+  } else {
+    const langFindings = languageFindings();
+    langFindings.forEach(f=>{
+      add("warning",f.page,"No document language is set. Export a tagged PDF to set the document language (WCAG 3.1.1, Matterhorn 11-001).");
+    });
+    if (!langFindings.length){
+      if (S.docLang)
+        add("info",0,`Document language is set to “${S.docLang}” (WCAG 3.1.1).`);
+      else
+        add("info",0,"Document language is set on the page(s) (WCAG 3.1.1).");
+    }
+  }
   S.issues = issues;
   const e = issues.filter(i=>i.sev==="error").length, w = issues.filter(i=>i.sev==="warning").length;
   logEvent("Checker run", `${e} error(s), ${w} warning(s)`);
@@ -5105,6 +5138,18 @@ function detectIssues(){
         suggestion:"Export a tagged PDF — export sets tab order to structure order automatically.",
         canAuto:false,
         manualFix:()=>{ selectIssueItem({page:f.page}); taggedPDFDialog(); }});
+  });
+  // document language (WCAG 3.1.1, Matterhorn 11-001): warnings only; the
+  // pass case is not an issue. The fix is the tagged-PDF export, which
+  // writes the document language into the catalog automatically — the
+  // manual fix opens that export dialog.
+  languageFindings().forEach(f=>{
+    add({sev:"warning", page:f.page,
+      title:"No document language set",
+      description:`Page ${f.page} has no language of its own and the document has no catalog language, so assistive technology cannot determine the language to read the page in.`,
+      suggestion:"Export a tagged PDF — export writes the document language (default en-US) into the catalog automatically.",
+      canAuto:false,
+      manualFix:()=>{ selectIssueItem({page:f.page}); taggedPDFDialog(); }});
   });
   S.pages.forEach(pg=>{
     pg.items.filter(i=>!i.hidden).forEach(it=>{
@@ -6425,6 +6470,36 @@ async function readTabOrder(){
     });
     S.tabsKnown = true;
   }catch(e){ console.warn("tab order read failed:", e.message); }
+}
+/* ----- document language (WCAG 3.1.1, Matterhorn 11-001) -----
+   Read the catalog /Lang and each page dictionary's /Lang on load with
+   pdf-lib, so the checker can report it without re-reading the file.
+   Export already writes /Lang (default en-US) into the catalog; this is
+   the checker half. A page inherits the catalog language when it has
+   none of its own.
+   S.docLang: catalog language string, or null (key missing).
+   pg.lang: page language string, or null (key missing).
+   S.langKnown is false when the file could not be re-read. */
+async function readLanguage(){
+  S.langKnown = false; S.docLang = null;
+  try{
+    const pdfDoc = await PDFLib.PDFDocument.load(await pdfBytes());
+    const PN = n=>PDFLib.PDFName.of(n);
+    const langStr = v=>{
+      if (!v) return null;
+      try{ if (v instanceof PDFLib.PDFString) return v.decodeText() || null; }catch(e){}
+      return String(v) || null;
+    };
+    S.docLang = langStr(pdfDoc.catalog.lookup(PN("Lang")));
+    pdfDoc.getPages().forEach((page, i)=>{
+      const pg = S.pages[i];
+      if (!pg) return;
+      let lang = null;
+      try{ lang = langStr(page.node.lookup(PN("Lang"))); }catch(e){}
+      pg.lang = lang;
+    });
+    S.langKnown = true;
+  }catch(e){ console.warn("language read failed:", e.message); }
 }
 
 </script>
