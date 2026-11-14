@@ -6060,6 +6060,35 @@ function pageContentsInfo(ctx, page){
 
 /* ----- text run extraction + matching ----- */
 const WIN1252 = {128:"€",130:"‚",131:"ƒ",132:"„",133:"…",134:"†",135:"‡",136:"ˆ",137:"‰",138:"Š",139:"‹",140:"Œ",142:"Ž",145:"‘",146:"’",147:"“",148:"”",149:"•",150:"–",151:"—",152:"˜",153:"™",154:"š",155:"›",156:"œ",158:"ž",159:"Ÿ"};
+/* Windows-1252 encoder: the inverse of the WIN1252 decode table above.
+   The old encoder truncated every code point to its low byte, so U+2019
+   (curly apostrophe, byte 0x92) became 0x19. The decoder above (and
+   TextDecoder("latin1")) reads bytes 0x80-0x9F as these punctuation
+   characters, so the encoder must map them back to the same bytes. */
+const WIN1252_REV = {};
+Object.keys(WIN1252).forEach(b=>{ WIN1252_REV[WIN1252[b]] = +b; });
+/* Map one character to its Windows-1252 byte, or -1 when the character
+   has no WinAnsi byte. Bytes 0x00-0x7F and 0xA0-0xFF map to themselves. */
+function win1252Byte(ch){
+  const code = ch.charCodeAt(0);
+  if (code <= 0x7F || (code >= 0xA0 && code <= 0xFF)) return code;
+  const b = WIN1252_REV[ch];
+  return b !== undefined ? b : -1;
+}
+/* Encode a string as Windows-1252 bytes. A character with no WinAnsi
+   byte is replaced with a visible "?" and the replacement is logged
+   once, instead of silently writing a wrong byte. */
+function win1252Encode(s){
+  const b = new Uint8Array(s.length);
+  let unmapped = "";
+  for (let i=0;i<s.length;i++){
+    const byte = win1252Byte(s[i]);
+    if (byte < 0){ b[i] = 0x3F; if (!unmapped.includes(s[i])) unmapped += s[i]; }
+    else b[i] = byte;
+  }
+  if (unmapped) logEvent("Tagged export", "Characters with no Windows-1252 byte were replaced with \"?\": " + [...unmapped].map(ch=>"U+"+ch.charCodeAt(0).toString(16).toUpperCase().padStart(4,"0")).join(", "));
+  return b;
+}
 function bytesToText(bytes){
   let s="";
   for (const b of bytes){
@@ -6084,8 +6113,8 @@ function unescapeLiteral(inner){
         let oct=n;
         for(let k=0;k<2&&i+1<inner.length&&/[0-7]/.test(inner[i+1]);k++) oct+=inner[++i];
         bytes.push(parseInt(oct,8)&255);
-      } else bytes.push(n.charCodeAt(0)&255);
-    } else bytes.push(c.charCodeAt(0)&255);
+      } else { const b=win1252Byte(n); bytes.push(b<0?0x3F:b); }
+    } else { const b=win1252Byte(c); bytes.push(b<0?0x3F:b); }
   }
   return bytesToText(bytes);
 }
@@ -6102,8 +6131,9 @@ function hexToText(hex){
   return bytesToText(bytes);
 }
 function normStr(s){ return s.toLowerCase().replace(/[^a-z0-9]/g,""); }
-function latin1Encode(s){ const b=new Uint8Array(s.length);
-  for (let i=0;i<s.length;i++) b[i]=s.charCodeAt(i)&255; return b; }
+/* Kept name for the one call site below; this is really the Windows-1252
+   encoder above (the old truncation is gone). */
+function latin1Encode(s){ return win1252Encode(s); }
 
 function extractRuns(text){
   const runs=[];
@@ -6137,6 +6167,7 @@ function extractRuns(text){
    one block so no content is ever lost. */
 function splitRunsForPieces(pg, runs){
   const groups={};
+  const unmappedSplit = new Set();
   pg.items.forEach(it=>{ if(it.splitId) (groups[it.splitId]=groups[it.splitId]||[]).push(it); });
   const ok=new Set();
   for (const gid of Object.keys(groups)){
@@ -6153,7 +6184,9 @@ function splitRunsForPieces(pg, runs){
     if(!isLit&&!isHex) continue;
     const enc = p => isLit
       ? "("+p.text.replace(/\\/g,"\\\\").replace(/\(/g,"\\(").replace(/\)/g,"\\)")
-          .replace(/[^\x20-\x7E]/g,ch=>"\\"+ch.charCodeAt(0).toString(8).padStart(3,"0"))+") Tj"
+          .replace(/[^\x20-\x7E]/g,ch=>{ const b=win1252Byte(ch);
+            if (b<0){ unmappedSplit.add(ch); return "?"; }
+            return "\\"+b.toString(8).padStart(3,"0"); })+") Tj"
       : "<FEFF"+[...p.text].map(ch=>ch.codePointAt(0).toString(16).padStart(4,"0").toUpperCase()).join("")+"> Tj";
     const newRuns=pieces.map(p=>({kind:"text", text:p.text, raw:enc(p),
       start:run.start, end:run.end}));
@@ -6161,6 +6194,7 @@ function splitRunsForPieces(pg, runs){
     run._consumed=true;
     ok.add(gid);
   }
+  if (unmappedSplit.size) logEvent("Tagged export", "Characters with no Windows-1252 byte were replaced with \"?\" in split text: " + [...unmappedSplit].map(ch=>"U+"+ch.charCodeAt(0).toString(16).toUpperCase().padStart(4,"0")).join(", "));
   return ok;
 }
 function buildAssignments(pg, splitOk){
