@@ -232,7 +232,7 @@ const S = {
   pdfDoc: null, pdfFile: null, fileName: "", pages: [],
   currentPage: 1, viewMode: "all", selected: new Set(), issues: [],
   signatures: {},
-  filled: {}, log: [], undoStack: [], redoStack: [], contrastScan: null, tabsKnown: false, langKnown: false, docLang: null, displayDocTitleKnown: false, displayDocTitle: null,
+  filled: {}, log: [], undoStack: [], redoStack: [], contrastScan: null, tabsKnown: false, langKnown: false, docLang: null, displayDocTitleKnown: false, displayDocTitle: null, xmpKnown: false, xmpState: null,
   docTitle: "", readingOrder: {}, tables: {}, groups: {},
   dirty: false, saveName: null, saveFormat: null, saveHandle: null,
   accelerators: {},
@@ -534,6 +534,7 @@ async function loadFile(file){  if (file.type !== "application/pdf" && !/\.pdf$/
     await readTabOrder();
     await readLanguage();
     await readDisplayDocTitle();
+    await readXmpMetadata();
     $("workbench").hidden = false;
     setFileStatus(`Loaded ${file.name}: ${S.pdfDoc.numPages} page(s).${metaTitle ? "" : " Warning: the document has no title."}`, !metaTitle);
     logEvent("Opened file", file.name);
@@ -5105,6 +5106,26 @@ function runChecker(){
     if (!ddtFindings.length)
       add("info",0,"Document title will be displayed in the viewer title bar (DisplayDocTitle is set; Matterhorn 07-001, 07-002).");
   }
+  // XMP metadata (Matterhorn 06-001, 06-002, 06-003): catalog Metadata
+  // stream, PDF/UA identifier, and dc:title read on load. A stream
+  // that could not be decoded is "could not be determined", never a pass.
+  if (!S.xmpKnown){
+    add("info",0,"XMP metadata could not be checked — the file could not be read again.");
+  } else if (S.xmpState && (S.xmpState.hasPdfUaId===null || S.xmpState.hasDcTitle===null)){
+    add("info",0,"XMP metadata could not be determined — the Metadata stream could not be decoded.");
+  } else {
+    const xmpFindingsList = xmpFindings();
+    xmpFindingsList.forEach(f=>{
+      if (f.kind==="missing")
+        add("warning",0,"No XMP metadata stream in the document catalog. Export a tagged PDF to add XMP metadata with the document title and PDF/UA identifier (Matterhorn 06-001).");
+      else if (f.kind==="noPdfUaId")
+        add("warning",0,"XMP metadata has no PDF/UA identifier (pdfuaid:part). Export a tagged PDF to add the PDF/UA-1 identifier (Matterhorn 06-002).");
+      else
+        add("warning",0,"XMP metadata has no document title (dc:title). Export a tagged PDF to write the document title into the XMP metadata (Matterhorn 06-003).");
+    });
+    if (!xmpFindingsList.length)
+      add("info",0,"XMP metadata is present with the document title (dc:title) and PDF/UA identifier (pdfuaid:part 1) (Matterhorn 06-001, 06-002, 06-003).");
+  }
   S.issues = issues;
   const e = issues.filter(i=>i.sev==="error").length, w = issues.filter(i=>i.sev==="warning").length;
   logEvent("Checker run", `${e} error(s), ${w} warning(s)`);
@@ -5198,6 +5219,33 @@ function detectIssues(){
         title:"Document title not set to display",
         description:"The document catalog has no ViewerPreferences DisplayDocTitle entry, so viewers show the file name in the title bar instead of the document title.",
         suggestion:"Export a tagged PDF — export sets DisplayDocTitle to true automatically.",
+        canAuto:false,
+        manualFix:()=>{ selectIssueItem({page:0}); taggedPDFDialog(); }});
+  });
+  // XMP metadata (Matterhorn 06-001, 06-002, 06-003): warnings only;
+  // the pass case is not an issue. The fix is the tagged-PDF export,
+  // which writes the XMP Metadata stream (dc:title + pdfuaid:part 1)
+  // automatically — the manual fix opens that export dialog.
+  xmpFindings().forEach(f=>{
+    if (f.kind==="missing")
+      add({sev:"warning", page:0,
+        title:"No XMP metadata",
+        description:"The document catalog has no XMP Metadata stream, so checkers such as PAC report missing metadata.",
+        suggestion:"Export a tagged PDF — export writes an XMP metadata stream with the document title and the PDF/UA-1 identifier automatically.",
+        canAuto:false,
+        manualFix:()=>{ selectIssueItem({page:0}); taggedPDFDialog(); }});
+    else if (f.kind==="noPdfUaId")
+      add({sev:"warning", page:0,
+        title:"XMP metadata has no PDF/UA identifier",
+        description:"The XMP metadata stream has no pdfuaid:part entry, so the file does not identify itself as PDF/UA-1.",
+        suggestion:"Export a tagged PDF — export writes the PDF/UA-1 identifier (pdfuaid:part 1) into the XMP metadata automatically.",
+        canAuto:false,
+        manualFix:()=>{ selectIssueItem({page:0}); taggedPDFDialog(); }});
+    else
+      add({sev:"warning", page:0,
+        title:"XMP metadata has no document title",
+        description:"The XMP metadata stream has no dc:title entry, so the document title is not recorded in the metadata.",
+        suggestion:"Export a tagged PDF — export writes the document title into the XMP metadata (dc:title) automatically.",
         canAuto:false,
         manualFix:()=>{ selectIssueItem({page:0}); taggedPDFDialog(); }});
   });
@@ -6413,6 +6461,16 @@ function buildTaggedPDF(title, lang, outName, returnBlob){
       // DisplayDocTitle (Matterhorn 07-001, 07-002): tell viewers to show
       // the document title in the window title bar instead of the file name.
       pdfDoc.catalog.getOrCreateViewerPreferences().setDisplayDocTitle(true);
+      // XMP metadata (Matterhorn 06-001, 06-002, 06-003): a catalog
+      // Metadata stream carrying dc:title (the same title written to
+      // the Info dictionary above) and the PDF/UA-1 identifier.
+      // pdf-lib writes no XMP by itself, so the packet is built by
+      // buildXmpPacket() and attached as a raw (uncompressed) stream,
+      // /Type /Metadata /Subtype /XML. It replaces any XMP the source
+      // file had, so the metadata title can never disagree with the
+      // exported title.
+      const xmpStream = ctx.stream(new TextEncoder().encode(buildXmpPacket(title)), {Type:"Metadata", Subtype:"XML"});
+      pdfDoc.catalog.set(PN("Metadata"), ctx.register(xmpStream));
       S.docTitle=title;
 
       // Embed applied electronic signatures as images with Figure tagging + metadata.
@@ -6492,6 +6550,100 @@ async function enrichFieldTooltips(){
       if (it.kind==="field" && !it.tooltip && tuByName[it.fieldName]) it.tooltip = tuByName[it.fieldName];
     }));
   }catch(e){ console.warn("tooltip enrichment failed:", e.message); }
+}
+/* ----- XMP metadata (Matterhorn 06-001, 06-002, 06-003) -----
+   Read the catalog Metadata stream on load with pdf-lib, so the
+   checker can report it without re-reading the file. Export writes
+   the stream (see buildTaggedPDF); this is the checker half.
+   S.xmpState: {hasMetadata, hasPdfUaId, hasDcTitle}. hasPdfUaId /
+   hasDcTitle are null when the stream exists but its bytes could not
+   be decoded — "could not be determined", never a pass.
+   S.xmpKnown is false when the file could not be re-read.
+   Parsing is tolerant string/regex matching on the decoded stream
+   text, not a full XML parser: XMP is UTF-8 by specification, but
+   NUL bytes are stripped first so UTF-16 sources still match. */
+function escapeXml(s){
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+/* Minimal well-formed XMP packet: dc:title in the rdf:Alt /
+   x-default form (the form Acrobat and PAC read) and pdfuaid:part 1,
+   the PDF/UA-1 identifier (namespace http://www.aiim.org/pdfua/ns/id/).
+   When there is no title, dc:title is omitted rather than written
+   empty: an empty title element would claim a title that does not
+   exist. In practice the export dialog always requires a title, so
+   exports carry one. */
+function buildXmpPacket(title){
+  const t = (title||"").trim();
+  const titleEl = t ? `   <dc:title><rdf:Alt><rdf:li xml:lang="x-default">${escapeXml(t)}</rdf:li></rdf:Alt></dc:title>\n` : "";
+  return `<?xpacket begin="\uFEFF" id="W5M0MpCehiHzreSzNTczkc9d"?>\n`+
+    `<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="FRAME PDF Studio">\n`+
+    ` <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n`+
+    `  <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:pdfuaid="http://www.aiim.org/pdfua/ns/id/">\n`+
+    titleEl+
+    `   <pdfuaid:part>1</pdfuaid:part>\n`+
+    `  </rdf:Description>\n`+
+    ` </rdf:RDF>\n`+
+    `</x:xmpmeta>\n`+
+    `<?xpacket end="w"?>`;
+}
+async function readXmpMetadata(){
+  S.xmpKnown = false; S.xmpState = null;
+  try{
+    const pdfDoc = await PDFLib.PDFDocument.load(await pdfBytes());
+    const PN = n=>PDFLib.PDFName.of(n);
+    const ref = pdfDoc.catalog.get(PN("Metadata"));
+    if (!ref){
+      S.xmpState = {hasMetadata:false, hasPdfUaId:false, hasDcTitle:false};
+      S.xmpKnown = true;
+      return;
+    }
+    let stream = null;
+    try{ stream = pdfDoc.context.lookup(ref); }catch(e){}
+    if (!stream || typeof stream.getContents !== "function"){
+      S.xmpState = {hasMetadata:true, hasPdfUaId:null, hasDcTitle:null};
+      S.xmpKnown = true;
+      return;
+    }
+    let bytes = null;
+    try{
+      const raw = stream.getContents();
+      const filterObj = stream.dict ? stream.dict.get(PN("Filter")) : null;
+      bytes = decodeStreamBytes(raw, filterObj);
+    }catch(e){ bytes = null; }
+    if (!bytes){
+      S.xmpState = {hasMetadata:true, hasPdfUaId:null, hasDcTitle:null};
+      S.xmpKnown = true;
+      return;
+    }
+    let text = new TextDecoder("utf-8").decode(bytes);
+    if (text.indexOf("\u0000") >= 0) text = text.replace(/\u0000/g, "");
+    const hasPdfUaId = /<pdfuaid:part[^>]*>\s*[0-9]+\s*<\/pdfuaid:part>/i.test(text);
+    const titleMatch = /<dc:title[^>]*>([\s\S]*?)<\/dc:title>/i.exec(text);
+    let hasDcTitle = false;
+    if (titleMatch){
+      const inner = titleMatch[1].replace(/<[^>]*>/g, "").trim();
+      hasDcTitle = inner.length > 0;
+    }
+    S.xmpState = {hasMetadata:true, hasPdfUaId, hasDcTitle};
+    S.xmpKnown = true;
+  }catch(e){ console.warn("XMP metadata read failed:", e.message); }
+}
+/* XMP findings shared by the finish checker and the issues panel.
+   kind "missing": no catalog Metadata stream (06-001).
+   kind "noPdfUaId": stream present but no pdfuaid:part (06-002).
+   kind "noDcTitle": stream present but no (non-empty) dc:title
+   (06-003). Returns [] when the values could not be read on load,
+   when the stream could not be decoded, or when all three are
+   present (pass). */
+function xmpFindings(){
+  if (!S.xmpKnown || !S.xmpState) return [];
+  const s = S.xmpState;
+  if (!s.hasMetadata) return [{page:0, kind:"missing"}];
+  if (s.hasPdfUaId === null || s.hasDcTitle === null) return [];
+  const out = [];
+  if (!s.hasPdfUaId) out.push({page:0, kind:"noPdfUaId"});
+  if (!s.hasDcTitle) out.push({page:0, kind:"noDcTitle"});
+  return out;
 }
 /* ----- tab order (WCAG 2.4.3, Matterhorn 28-008, 28-009) -----
    Read each page dictionary's Tabs value on load with pdf-lib, so the
