@@ -3438,14 +3438,30 @@ function makeOptionGroupDialog(kind){
       const perItem = sel.length===opts.length;
       const newIds = [];
       const made = [];
+      // Place each field in display space (what the user sees), then convert
+      // to PDF user space for storage/export — the same rotation-aware
+      // placement createFieldDialog uses. The old code did its arithmetic on
+      // the stored rects directly, which are transposed on rotated pages, so
+      // a checkbox/radio on a rotated page landed offset from its option text
+      // (and the no-source fallback landed far from the anchor). On unrotated
+      // pages both conversions are identity, so behavior there is unchanged.
+      const anchorD = after ? itemDisplayRect(after, pg) : null;
       opts.forEach((opt,idx)=>{
         const src = perItem ? sel[idx] : null;
         const fname = isRadio ? gname : `${gname}_${idx+1}`;
+        let d;
+        if (src){
+          const srcD = itemDisplayRect(src, pg);
+          d = {x:Math.max(8, srcD.x-24), y:srcD.y, w:16, h:16};
+        } else if (anchorD){
+          d = {x:72, y:anchorD.y - 30 - idx*26, w:16, h:16};
+        } else {
+          d = {x:72, y:72, w:16, h:16};
+        }
+        const r0 = displayRectToPdf(d, pg);
         made.push({id:uid("p"+targetPage+"-i"), page:targetPage, kind:"field",
           role:"Form", text:`Field: ${fname}`,
-          x:src?Math.max(8,src.x-24):72,
-          y:src?src.y:(after.y-30-idx*26),
-          w:16, h:16, order:0,
+          x:r0.x, y:r0.y, w:r0.w, h:r0.h, order:0,
           artifact:false, url:"", alt:"",
           tooltip:`${question}: ${opt}`, value:"",
           fieldName:fname, fieldType:"Btn",
